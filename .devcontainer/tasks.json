@@ -1,0 +1,18 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Avvia Market Sentinel",
+            "type": "shell",
+            "command": "streamlit run streamlit_app.py --server.enableCORS false --server.enableXsrfProtection false",
+            "runOptions": {
+                "runOn": "folderOpen"
+            },
+            "presentation": {
+                "group": "avvio_app",
+                "reveal": "always",
+                "panel": "new"
+            }
+        }
+    ]
+}

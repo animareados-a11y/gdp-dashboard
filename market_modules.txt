@@ -1,0 +1,4785 @@
+import os
+import numpy as np
+import pandas as pd
+
+from backtest import download_backtest_frames
+from indicators import add_all
+
+
+# ============================================================
+# MARKET SENTINEL
+# WEEKLY PHASE 1 - SEQUENCE V1
+#
+# SCOPO
+#
+# Studiare le inversioni Weekly usando SOLO:
+#
+#   1. HEIKIN ASHI
+#   2. BOLLINGER
+#   3. PARABOLIC SAR
+#
+# NON consideriamo un semplice cambio colore HA
+# come inversione.
+#
+# Cerchiamo invece una SEQUENZA:
+#
+# TREND PRECEDENTE
+#       ↓
+# PRESSIONE SU BOLLINGER ESTERNA
+#       ↓
+# PERDITA DI SPINTA / INDECISIONE
+#       ↓
+# CAMBIO HA
+#       ↓
+# SAR VICINO / FLIP / CONFERMA
+#
+# Tutti i segnali vengono costruiti usando SOLO
+# dati disponibili fino a quella settimana.
+#
+# Il Ground Truth V2 viene usato esclusivamente
+# DOPO per verificare se il segnale era corretto.
+# ============================================================
+
+
+# ============================================================
+# CONFIGURAZIONE
+# ============================================================
+
+TICKERS = [
+    "LDO.MI",
+    "UCG.MI",
+    "ENI.MI",
+]
+
+GROUND_TRUTH_FILE = (
+    "data/weekly_ground_truth_v2.csv"
+)
+
+OUTPUT_EVENTS_FILE = (
+    "data/weekly_phase1_sequence_v1_events.csv"
+)
+
+OUTPUT_SUMMARY_FILE = (
+    "data/weekly_phase1_sequence_v1_summary.csv"
+)
+
+OUTPUT_FEATURES_FILE = (
+    "data/weekly_phase1_sequence_v1_features.csv"
+)
+
+
+# ============================================================
+# FINESTRA DI MATCH CON IL PIVOT VERO
+#
+# Un segnale è considerato corretto se arriva:
+#
+#   - massimo 1 settimana PRIMA del pivot
+#   - massimo 2 settimane DOPO il pivot
+#
+# Questa finestra NON viene usata per generare il segnale.
+# Serve solo per il test ex-post.
+# ============================================================
+
+MATCH_WEEKS_BEFORE = 1
+MATCH_WEEKS_AFTER = 2
+
+
+# ============================================================
+# CONTESTO
+# ============================================================
+
+CONTEXT_WEEKS = 4
+
+# Per dire che prima esisteva un vero trend HA
+# richiediamo almeno 2 candele su 4 coerenti.
+MIN_PREVIOUS_HA_COUNT = 2
+
+# Analogo per SAR.
+MIN_PREVIOUS_SAR_COUNT = 2
+
+
+# ============================================================
+# HEIKIN ASHI
+# ============================================================
+
+HA_INDECISION_LIMIT = 0.25
+
+
+# ============================================================
+# BOLLINGER
+#
+# BB_Position:
+#
+# 0.00 = banda inferiore
+# 0.50 = banda centrale
+# 1.00 = banda superiore
+#
+# può andare anche sotto 0 o sopra 1.
+# ============================================================
+
+BB_STRESS_LIMIT = 0.10
+
+BB_EXTREME_LIMIT = 0.00
+
+BB_RETREAT_MIN = 0.10
+
+
+# ============================================================
+# SAR
+#
+# Se SAR non è ancora girato ma si trova relativamente
+# vicino al prezzo, lo interpretiamo come possibile
+# indebolimento del trend.
+# ============================================================
+
+SAR_NEAR_ATR = 1.25
+
+SAR_RECENT_FLIP_WEEKS = 2
+
+
+# ============================================================
+# COOLDOWN
+#
+# Evita che una stessa struttura generi 3-4 segnali
+# consecutivi per lo stesso titolo.
+# ============================================================
+
+SIGNAL_COOLDOWN_WEEKS = 3
+
+
+# ============================================================
+# SOGLIE SCORE
+#
+# NON stiamo ottimizzando queste soglie con ML.
+#
+# Le confrontiamo tutte, per capire quanto aumenta
+# precisione e quanto perdiamo in recall.
+# ============================================================
+
+SCORE_THRESHOLDS = [
+    50,
+    60,
+    70,
+    80,
+]
+
+
+# ============================================================
+# UTILITY
+# ============================================================
+
+def safe_float(
+    value,
+    default=np.nan
+):
+
+    try:
+
+        value = float(
+            value
+        )
+
+        if np.isfinite(
+            value
+        ):
+
+            return value
+
+    except Exception:
+        pass
+
+    return default
+
+
+def safe_bool(
+    value
+):
+
+    try:
+
+        if pd.isna(
+            value
+        ):
+            return False
+
+    except Exception:
+        pass
+
+    try:
+        return bool(
+            value
+        )
+
+    except Exception:
+        return False
+
+
+def normalize_timestamp(
+    value
+):
+
+    value = pd.Timestamp(
+        value
+    )
+
+    if value.tzinfo is None:
+
+        value = value.tz_localize(
+            "UTC"
+        )
+
+    else:
+
+        value = value.tz_convert(
+            "UTC"
+        )
+
+    return value.normalize()
+
+
+def normalize_index(
+    df
+):
+
+    data = df.copy()
+
+    data.index = pd.to_datetime(
+        data.index,
+        utc=True
+    )
+
+    data = (
+        data
+        .sort_index()
+    )
+
+    data = data[
+        ~data.index.duplicated(
+            keep="last"
+        )
+    ]
+
+    return data
+
+
+def pct(
+    numerator,
+    denominator
+):
+
+    if denominator == 0:
+        return np.nan
+
+    return (
+        float(
+            numerator
+        )
+        /
+        float(
+            denominator
+        )
+        *
+        100.0
+    )
+
+
+# ============================================================
+# GROUND TRUTH
+# ============================================================
+
+def detect_column(
+    df,
+    candidates,
+    required=True
+):
+
+    normalized = {
+        str(
+            column
+        ).strip().lower():
+        column
+
+        for column
+        in df.columns
+    }
+
+    for candidate in candidates:
+
+        key = (
+            str(
+                candidate
+            )
+            .strip()
+            .lower()
+        )
+
+        if key in normalized:
+
+            return normalized[
+                key
+            ]
+
+    if required:
+
+        raise RuntimeError(
+            "Colonna Ground Truth non trovata.\n"
+            "Cercavo: "
+            +
+            ", ".join(
+                candidates
+            )
+            +
+            "\nColonne presenti: "
+            +
+            ", ".join(
+                map(
+                    str,
+                    df.columns
+                )
+            )
+        )
+
+    return None
+
+
+def load_ground_truth():
+
+    if not os.path.exists(
+        GROUND_TRUTH_FILE
+    ):
+
+        raise RuntimeError(
+            f"File non trovato: "
+            f"{GROUND_TRUTH_FILE}"
+        )
+
+    gt = pd.read_csv(
+        GROUND_TRUTH_FILE
+    )
+
+    ticker_col = detect_column(
+        gt,
+        [
+            "Ticker",
+            "ticker",
+            "symbol",
+        ]
+    )
+
+    direction_col = detect_column(
+        gt,
+        [
+            "pivot_type",
+            "Direction",
+            "direction",
+            "type",
+            "signal",
+            "reversal_type",
+        ]
+    )
+
+    date_col = detect_column(
+        gt,
+        [
+            "pivot_date",
+            "PivotDate",
+            "date",
+            "pivot",
+        ]
+    )
+
+    valid_col = detect_column(
+        gt,
+        [
+            "valid_ground_truth",
+            "valid",
+            "completed",
+            "evaluable",
+        ],
+        required=False
+    )
+
+    confirmation_col = detect_column(
+        gt,
+        [
+            "confirmation_date",
+            "ConfirmationDate",
+        ],
+        required=False
+    )
+
+    gt = gt.copy()
+
+    gt["Ticker"] = (
+        gt[
+            ticker_col
+        ]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
+
+    gt["Direction"] = (
+        gt[
+            direction_col
+        ]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
+
+    gt["Direction"] = (
+        gt[
+            "Direction"
+        ]
+        .replace(
+            {
+                "BUY_REVERSAL":
+                    "BUY",
+
+                "SELL_REVERSAL":
+                    "SELL",
+
+                "BULLISH":
+                    "BUY",
+
+                "BEARISH":
+                    "SELL",
+
+                "LOW":
+                    "BUY",
+
+                "HIGH":
+                    "SELL",
+            }
+        )
+    )
+
+    gt["PivotDate"] = (
+        pd.to_datetime(
+            gt[
+                date_col
+            ],
+            utc=True,
+            errors="coerce"
+        )
+        .dt.normalize()
+    )
+
+    if confirmation_col is not None:
+
+        gt["ConfirmationDate"] = (
+            pd.to_datetime(
+                gt[
+                    confirmation_col
+                ],
+                utc=True,
+                errors="coerce"
+            )
+            .dt.normalize()
+        )
+
+    else:
+
+        gt[
+            "ConfirmationDate"
+        ] = pd.NaT
+
+    if valid_col is not None:
+
+        valid_text = (
+            gt[
+                valid_col
+            ]
+            .astype(str)
+            .str.lower()
+            .str.strip()
+        )
+
+        mask = valid_text.isin(
+            [
+                "true",
+                "1",
+                "yes",
+                "y",
+                "si",
+                "sì",
+            ]
+        )
+
+        if mask.any():
+
+            gt = gt[
+                mask
+            ].copy()
+
+    gt = gt[
+        gt[
+            "Direction"
+        ].isin(
+            [
+                "BUY",
+                "SELL",
+            ]
+        )
+    ].copy()
+
+    gt = gt[
+        gt[
+            "Ticker"
+        ].isin(
+            TICKERS
+        )
+    ].copy()
+
+    gt = gt.dropna(
+        subset=[
+            "PivotDate",
+        ]
+    )
+
+    gt = (
+        gt
+        .sort_values(
+            [
+                "Ticker",
+                "PivotDate",
+            ]
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+    return gt[
+        [
+            "Ticker",
+            "Direction",
+            "PivotDate",
+            "ConfirmationDate",
+        ]
+    ]
+
+
+# ============================================================
+# WEEKLY DATA
+# ============================================================
+
+def get_weekly_data(
+    ticker
+):
+
+    frames = (
+        download_backtest_frames(
+            ticker
+        )
+    )
+
+    weekly = frames.get(
+        "Weekly"
+    )
+
+    if (
+        weekly is None
+        or
+        weekly.empty
+    ):
+
+        raise RuntimeError(
+            f"Weekly mancante "
+            f"per {ticker}"
+        )
+
+    weekly = normalize_index(
+        weekly
+    )
+
+    required = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+    ]
+
+    missing = [
+        column
+
+        for column
+        in required
+
+        if column
+        not in weekly.columns
+    ]
+
+    if missing:
+
+        raise RuntimeError(
+            f"{ticker}: colonne mancanti: "
+            +
+            ", ".join(
+                missing
+            )
+        )
+
+    data = add_all(
+        weekly
+    )
+
+    data = normalize_index(
+        data
+    )
+
+    return data
+
+
+# ============================================================
+# FEATURE ENGINE
+# ============================================================
+
+def build_features(
+    data
+):
+
+    out = data.copy()
+
+    # ========================================================
+    # HEIKIN ASHI
+    # ========================================================
+
+    out[
+        "HA_Bull"
+    ] = (
+        out[
+            "HA_Close"
+        ]
+        >
+        out[
+            "HA_Open"
+        ]
+    )
+
+    out[
+        "HA_Bear"
+    ] = (
+        out[
+            "HA_Close"
+        ]
+        <
+        out[
+            "HA_Open"
+        ]
+    )
+
+    out[
+        "HA_Bull_Flip"
+    ] = (
+        out[
+            "HA_Bull"
+        ]
+        &
+        out[
+            "HA_Bear"
+        ]
+        .shift(1)
+        .fillna(False)
+    )
+
+    out[
+        "HA_Bear_Flip"
+    ] = (
+        out[
+            "HA_Bear"
+        ]
+        &
+        out[
+            "HA_Bull"
+        ]
+        .shift(1)
+        .fillna(False)
+    )
+
+    ha_range = (
+        out[
+            "HA_High"
+        ]
+        -
+        out[
+            "HA_Low"
+        ]
+    ).replace(
+        0,
+        np.nan
+    )
+
+    ha_body = (
+        out[
+            "HA_Close"
+        ]
+        -
+        out[
+            "HA_Open"
+        ]
+    ).abs()
+
+    out[
+        "HA_BodyPct_Sequence"
+    ] = (
+        ha_body
+        /
+        ha_range
+    ).fillna(
+        0
+    )
+
+    out[
+        "HA_Indecision_Sequence"
+    ] = (
+        out[
+            "HA_BodyPct_Sequence"
+        ]
+        <=
+        HA_INDECISION_LIMIT
+    )
+
+    # ========================================================
+    # BOLLINGER POSITION
+    # ========================================================
+
+    bb_width = (
+        out[
+            "BB_Upper"
+        ]
+        -
+        out[
+            "BB_Lower"
+        ]
+    ).replace(
+        0,
+        np.nan
+    )
+
+    out[
+        "BB_Position"
+    ] = (
+        (
+            out[
+                "HA_Close"
+            ]
+            -
+            out[
+                "BB_Lower"
+            ]
+        )
+        /
+        bb_width
+    )
+
+    out[
+        "BB_Lower_Stress"
+    ] = (
+        out[
+            "BB_Position"
+        ]
+        <=
+        BB_STRESS_LIMIT
+    )
+
+    out[
+        "BB_Upper_Stress"
+    ] = (
+        out[
+            "BB_Position"
+        ]
+        >=
+        (
+            1.0
+            -
+            BB_STRESS_LIMIT
+        )
+    )
+
+    out[
+        "BB_Lower_Extreme"
+    ] = (
+        out[
+            "BB_Position"
+        ]
+        <=
+        BB_EXTREME_LIMIT
+    )
+
+    out[
+        "BB_Upper_Extreme"
+    ] = (
+        out[
+            "BB_Position"
+        ]
+        >=
+        (
+            1.0
+            -
+            BB_EXTREME_LIMIT
+        )
+    )
+
+    out[
+        "BB_Mid_Cross_Up"
+    ] = (
+        (
+            out[
+                "HA_Close"
+            ]
+            >
+            out[
+                "BB_Mid"
+            ]
+        )
+        &
+        (
+            out[
+                "HA_Close"
+            ]
+            .shift(1)
+            <=
+            out[
+                "BB_Mid"
+            ]
+            .shift(1)
+        )
+    )
+
+    out[
+        "BB_Mid_Cross_Down"
+    ] = (
+        (
+            out[
+                "HA_Close"
+            ]
+            <
+            out[
+                "BB_Mid"
+            ]
+        )
+        &
+        (
+            out[
+                "HA_Close"
+            ]
+            .shift(1)
+            >=
+            out[
+                "BB_Mid"
+            ]
+            .shift(1)
+        )
+    )
+
+    # ========================================================
+    # SAR
+    # ========================================================
+
+    out[
+        "SAR_Bull"
+    ] = (
+        out[
+            "Close"
+        ]
+        >
+        out[
+            "SAR"
+        ]
+    )
+
+    out[
+        "SAR_Bear"
+    ] = (
+        out[
+            "Close"
+        ]
+        <
+        out[
+            "SAR"
+        ]
+    )
+
+    out[
+        "SAR_Bull_Flip"
+    ] = (
+        out[
+            "SAR_Bull"
+        ]
+        &
+        out[
+            "SAR_Bear"
+        ]
+        .shift(1)
+        .fillna(False)
+    )
+
+    out[
+        "SAR_Bear_Flip"
+    ] = (
+        out[
+            "SAR_Bear"
+        ]
+        &
+        out[
+            "SAR_Bull"
+        ]
+        .shift(1)
+        .fillna(False)
+    )
+
+    atr_value = (
+        out[
+            "ATR"
+        ]
+        .replace(
+            0,
+            np.nan
+        )
+    )
+
+    out[
+        "SAR_Distance_ATR"
+    ] = (
+        (
+            out[
+                "Close"
+            ]
+            -
+            out[
+                "SAR"
+            ]
+        )
+        .abs()
+        /
+        atr_value
+    )
+
+    out[
+        "SAR_Near"
+    ] = (
+        out[
+            "SAR_Distance_ATR"
+        ]
+        <=
+        SAR_NEAR_ATR
+    )
+
+    return out
+
+
+# ============================================================
+# CONTESTO DI UNA SINGOLA SETTIMANA
+#
+# Tutto ciò che viene letto appartiene:
+#
+# - alla settimana corrente
+# - oppure alle settimane precedenti
+#
+# Mai al futuro.
+# ============================================================
+
+def evaluate_sequence(
+    data,
+    position,
+    direction
+):
+
+    if position < CONTEXT_WEEKS:
+
+        return None
+
+    current = data.iloc[
+        position
+    ]
+
+    prior = data.iloc[
+        max(
+            0,
+            position
+            -
+            CONTEXT_WEEKS
+        ):
+        position
+    ]
+
+    recent_with_current = (
+        data.iloc[
+            max(
+                0,
+                position
+                -
+                SAR_RECENT_FLIP_WEEKS
+            ):
+            position
+            +
+            1
+        ]
+    )
+
+    score = 0.0
+
+    reasons = []
+
+    # ========================================================
+    # BUY
+    # ========================================================
+
+    if direction == "BUY":
+
+        previous_ha_count = int(
+            prior[
+                "HA_Bear"
+            ]
+            .fillna(False)
+            .sum()
+        )
+
+        previous_sar_count = int(
+            prior[
+                "SAR_Bear"
+            ]
+            .fillna(False)
+            .sum()
+        )
+
+        bb_stress = bool(
+            prior[
+                "BB_Lower_Stress"
+            ]
+            .fillna(False)
+            .any()
+        )
+
+        bb_extreme = bool(
+            prior[
+                "BB_Lower_Extreme"
+            ]
+            .fillna(False)
+            .any()
+        )
+
+        indecision_recent = bool(
+            prior[
+                "HA_Indecision_Sequence"
+            ]
+            .tail(2)
+            .fillna(False)
+            .any()
+        )
+
+        current_new_color = safe_bool(
+            current[
+                "HA_Bull"
+            ]
+        )
+
+        current_flip = safe_bool(
+            current[
+                "HA_Bull_Flip"
+            ]
+        )
+
+        sar_new_direction = safe_bool(
+            current[
+                "SAR_Bull"
+            ]
+        )
+
+        sar_near = safe_bool(
+            current[
+                "SAR_Near"
+            ]
+        )
+
+        sar_recent_flip = bool(
+            recent_with_current[
+                "SAR_Bull_Flip"
+            ]
+            .fillna(False)
+            .any()
+        )
+
+        bb_mid_cross = safe_bool(
+            current[
+                "BB_Mid_Cross_Up"
+            ]
+        )
+
+        prior_min_position = safe_float(
+            prior[
+                "BB_Position"
+            ].min()
+        )
+
+        current_bb_position = safe_float(
+            current[
+                "BB_Position"
+            ]
+        )
+
+        bb_retreat = False
+
+        if (
+            np.isfinite(
+                prior_min_position
+            )
+            and
+            np.isfinite(
+                current_bb_position
+            )
+        ):
+
+            bb_retreat = (
+                (
+                    current_bb_position
+                    -
+                    prior_min_position
+                )
+                >=
+                BB_RETREAT_MIN
+            )
+
+        # ----------------------------------------------------
+        # SCORE
+        # ----------------------------------------------------
+
+        if previous_ha_count >= 3:
+
+            score += 15
+
+            reasons.append(
+                "HA bearish precedente forte"
+            )
+
+        elif (
+            previous_ha_count
+            >=
+            MIN_PREVIOUS_HA_COUNT
+        ):
+
+            score += 10
+
+            reasons.append(
+                "HA bearish precedente"
+            )
+
+        if previous_sar_count >= 3:
+
+            score += 10
+
+            reasons.append(
+                "SAR bearish precedente"
+            )
+
+        elif (
+            previous_sar_count
+            >=
+            MIN_PREVIOUS_SAR_COUNT
+        ):
+
+            score += 5
+
+        if bb_stress:
+
+            score += 20
+
+            reasons.append(
+                "stress Bollinger inferiore"
+            )
+
+        if bb_extreme:
+
+            score += 5
+
+            reasons.append(
+                "eccesso sotto Bollinger"
+            )
+
+        if indecision_recent:
+
+            score += 8
+
+            reasons.append(
+                "HA indecisione recente"
+            )
+
+        if current_flip:
+
+            score += 25
+
+            reasons.append(
+                "HA gira verde"
+            )
+
+        elif current_new_color:
+
+            score += 10
+
+        if bb_retreat:
+
+            score += 12
+
+            reasons.append(
+                "distacco/rientro da Bollinger inferiore"
+            )
+
+        if sar_recent_flip:
+
+            score += 20
+
+            reasons.append(
+                "SAR gira rialzista"
+            )
+
+        elif sar_new_direction:
+
+            score += 15
+
+            reasons.append(
+                "SAR già rialzista"
+            )
+
+        elif sar_near:
+
+            score += 7
+
+            reasons.append(
+                "SAR vicino al prezzo"
+            )
+
+        if bb_mid_cross:
+
+            score += 5
+
+            reasons.append(
+                "recupero Bollinger centrale"
+            )
+
+        score = min(
+            score,
+            100.0
+        )
+
+        return {
+            "Direction":
+                "BUY",
+
+            "Score":
+                score,
+
+            "PreviousHA":
+                previous_ha_count,
+
+            "PreviousSAR":
+                previous_sar_count,
+
+            "BBStress":
+                bb_stress,
+
+            "BBExtreme":
+                bb_extreme,
+
+            "BBRetreat":
+                bb_retreat,
+
+            "HAIndecision":
+                indecision_recent,
+
+            "HAFlip":
+                current_flip,
+
+            "HANewColor":
+                current_new_color,
+
+            "SARNewDirection":
+                sar_new_direction,
+
+            "SARNear":
+                sar_near,
+
+            "SARRecentFlip":
+                sar_recent_flip,
+
+            "BBMidCross":
+                bb_mid_cross,
+
+            "Reasons":
+                " | ".join(
+                    reasons
+                ),
+        }
+
+    # ========================================================
+    # SELL
+    # ========================================================
+
+    previous_ha_count = int(
+        prior[
+            "HA_Bull"
+        ]
+        .fillna(False)
+        .sum()
+    )
+
+    previous_sar_count = int(
+        prior[
+            "SAR_Bull"
+        ]
+        .fillna(False)
+        .sum()
+    )
+
+    bb_stress = bool(
+        prior[
+            "BB_Upper_Stress"
+        ]
+        .fillna(False)
+        .any()
+    )
+
+    bb_extreme = bool(
+        prior[
+            "BB_Upper_Extreme"
+        ]
+        .fillna(False)
+        .any()
+    )
+
+    indecision_recent = bool(
+        prior[
+            "HA_Indecision_Sequence"
+        ]
+        .tail(2)
+        .fillna(False)
+        .any()
+    )
+
+    current_new_color = safe_bool(
+        current[
+            "HA_Bear"
+        ]
+    )
+
+    current_flip = safe_bool(
+        current[
+            "HA_Bear_Flip"
+        ]
+    )
+
+    sar_new_direction = safe_bool(
+        current[
+            "SAR_Bear"
+        ]
+    )
+
+    sar_near = safe_bool(
+        current[
+            "SAR_Near"
+        ]
+    )
+
+    sar_recent_flip = bool(
+        recent_with_current[
+            "SAR_Bear_Flip"
+        ]
+        .fillna(False)
+        .any()
+    )
+
+    bb_mid_cross = safe_bool(
+        current[
+            "BB_Mid_Cross_Down"
+        ]
+    )
+
+    prior_max_position = safe_float(
+        prior[
+            "BB_Position"
+        ].max()
+    )
+
+    current_bb_position = safe_float(
+        current[
+            "BB_Position"
+        ]
+    )
+
+    bb_retreat = False
+
+    if (
+        np.isfinite(
+            prior_max_position
+        )
+        and
+        np.isfinite(
+            current_bb_position
+        )
+    ):
+
+        bb_retreat = (
+            (
+                prior_max_position
+                -
+                current_bb_position
+            )
+            >=
+            BB_RETREAT_MIN
+        )
+
+    if previous_ha_count >= 3:
+
+        score += 15
+
+        reasons.append(
+            "HA bullish precedente forte"
+        )
+
+    elif (
+        previous_ha_count
+        >=
+        MIN_PREVIOUS_HA_COUNT
+    ):
+
+        score += 10
+
+        reasons.append(
+            "HA bullish precedente"
+        )
+
+    if previous_sar_count >= 3:
+
+        score += 10
+
+        reasons.append(
+            "SAR bullish precedente"
+        )
+
+    elif (
+        previous_sar_count
+        >=
+        MIN_PREVIOUS_SAR_COUNT
+    ):
+
+        score += 5
+
+    if bb_stress:
+
+        score += 20
+
+        reasons.append(
+            "stress Bollinger superiore"
+        )
+
+    if bb_extreme:
+
+        score += 5
+
+        reasons.append(
+            "eccesso sopra Bollinger"
+        )
+
+    if indecision_recent:
+
+        score += 8
+
+        reasons.append(
+            "HA indecisione recente"
+        )
+
+    if current_flip:
+
+        score += 25
+
+        reasons.append(
+            "HA gira rossa"
+        )
+
+    elif current_new_color:
+
+        score += 10
+
+    if bb_retreat:
+
+        score += 12
+
+        reasons.append(
+            "distacco/rientro da Bollinger superiore"
+        )
+
+    if sar_recent_flip:
+
+        score += 20
+
+        reasons.append(
+            "SAR gira ribassista"
+        )
+
+    elif sar_new_direction:
+
+        score += 15
+
+        reasons.append(
+            "SAR già ribassista"
+        )
+
+    elif sar_near:
+
+        score += 7
+
+        reasons.append(
+            "SAR vicino al prezzo"
+        )
+
+    if bb_mid_cross:
+
+        score += 5
+
+        reasons.append(
+            "rottura Bollinger centrale"
+        )
+
+    score = min(
+        score,
+        100.0
+    )
+
+    return {
+        "Direction":
+            "SELL",
+
+        "Score":
+            score,
+
+        "PreviousHA":
+            previous_ha_count,
+
+        "PreviousSAR":
+            previous_sar_count,
+
+        "BBStress":
+            bb_stress,
+
+        "BBExtreme":
+            bb_extreme,
+
+        "BBRetreat":
+            bb_retreat,
+
+        "HAIndecision":
+            indecision_recent,
+
+        "HAFlip":
+            current_flip,
+
+        "HANewColor":
+            current_new_color,
+
+        "SARNewDirection":
+            sar_new_direction,
+
+        "SARNear":
+            sar_near,
+
+        "SARRecentFlip":
+            sar_recent_flip,
+
+        "BBMidCross":
+            bb_mid_cross,
+
+        "Reasons":
+            " | ".join(
+                reasons
+            ),
+    }
+
+
+# ============================================================
+# RULES
+#
+# Non vogliamo ancora scegliere "la regola vincente".
+#
+# Confrontiamo più livelli.
+# ============================================================
+
+def rules_from_sequence(
+    sequence
+):
+
+    if sequence is None:
+
+        return []
+
+    rules = []
+
+    score = safe_float(
+        sequence.get(
+            "Score"
+        ),
+        0
+    )
+
+    direction = sequence[
+        "Direction"
+    ]
+
+    previous_ha = int(
+        sequence[
+            "PreviousHA"
+        ]
+    )
+
+    ha_flip = safe_bool(
+        sequence[
+            "HAFlip"
+        ]
+    )
+
+    ha_new_color = safe_bool(
+        sequence[
+            "HANewColor"
+        ]
+    )
+
+    bb_stress = safe_bool(
+        sequence[
+            "BBStress"
+        ]
+    )
+
+    bb_retreat = safe_bool(
+        sequence[
+            "BBRetreat"
+        ]
+    )
+
+    sar_new = safe_bool(
+        sequence[
+            "SARNewDirection"
+        ]
+    )
+
+    sar_flip = safe_bool(
+        sequence[
+            "SARRecentFlip"
+        ]
+    )
+
+    sar_near = safe_bool(
+        sequence[
+            "SARNear"
+        ]
+    )
+
+    # --------------------------------------------------------
+    # RULE HA CONTEXT
+    #
+    # Un flip HA conta solo se prima esisteva
+    # realmente un movimento opposto.
+    # --------------------------------------------------------
+
+    if (
+        ha_flip
+        and
+        previous_ha
+        >=
+        MIN_PREVIOUS_HA_COUNT
+    ):
+
+        rules.append(
+            "HA_CONTEXT"
+        )
+
+    # --------------------------------------------------------
+    # RULE HA + BOLLINGER
+    #
+    # È il pattern descritto visivamente:
+    #
+    # trend precedente
+    # + stress banda esterna
+    # + HA cambia colore.
+    # --------------------------------------------------------
+
+    if (
+        ha_flip
+        and
+        previous_ha
+        >=
+        MIN_PREVIOUS_HA_COUNT
+        and
+        bb_stress
+    ):
+
+        rules.append(
+            "HA_BB"
+        )
+
+    # --------------------------------------------------------
+    # HA + BB + distacco dalla banda
+    # --------------------------------------------------------
+
+    if (
+        ha_flip
+        and
+        previous_ha
+        >=
+        MIN_PREVIOUS_HA_COUNT
+        and
+        bb_stress
+        and
+        bb_retreat
+    ):
+
+        rules.append(
+            "HA_BB_RETREAT"
+        )
+
+    # --------------------------------------------------------
+    # Conferma SAR
+    #
+    # Non obblighiamo il SAR a flippare nella stessa
+    # identica settimana.
+    #
+    # Basta:
+    #
+    # - SAR già nella nuova direzione
+    # oppure
+    # - flip molto recente.
+    # --------------------------------------------------------
+
+    if (
+        ha_flip
+        and
+        previous_ha
+        >=
+        MIN_PREVIOUS_HA_COUNT
+        and
+        bb_stress
+        and
+        (
+            sar_new
+            or
+            sar_flip
+        )
+    ):
+
+        rules.append(
+            "HA_BB_SAR"
+        )
+
+    # --------------------------------------------------------
+    # Versione meno rigida:
+    # SAR vicino può costituire warning.
+    # --------------------------------------------------------
+
+    if (
+        ha_new_color
+        and
+        previous_ha
+        >=
+        MIN_PREVIOUS_HA_COUNT
+        and
+        bb_stress
+        and
+        (
+            sar_new
+            or
+            sar_flip
+            or
+            sar_near
+        )
+    ):
+
+        rules.append(
+            "SEQUENCE_CONTEXT"
+        )
+
+    # --------------------------------------------------------
+    # SCORE thresholds
+    # --------------------------------------------------------
+
+    for threshold in (
+        SCORE_THRESHOLDS
+    ):
+
+        if score >= threshold:
+
+            rules.append(
+                f"SCORE_{threshold}"
+            )
+
+    return rules
+
+
+# ============================================================
+# COSTRUISCI TUTTE LE OSSERVAZIONI
+# ============================================================
+
+def build_sequence_features(
+    ticker,
+    data
+):
+
+    rows = []
+
+    for position in range(
+        CONTEXT_WEEKS,
+        len(
+            data
+        )
+    ):
+
+        date = data.index[
+            position
+        ]
+
+        for direction in [
+            "BUY",
+            "SELL",
+        ]:
+
+            sequence = (
+                evaluate_sequence(
+                    data,
+                    position,
+                    direction
+                )
+            )
+
+            if sequence is None:
+                continue
+
+            row = {
+                "Ticker":
+                    ticker,
+
+                "Date":
+                    date,
+            }
+
+            row.update(
+                sequence
+            )
+
+            rows.append(
+                row
+            )
+
+    return pd.DataFrame(
+        rows
+    )
+
+
+# ============================================================
+# EVENTI
+# ============================================================
+
+def create_candidate_events(
+    features
+):
+
+    rows = []
+
+    for _, row in (
+        features.iterrows()
+    ):
+
+        sequence = {
+            key:
+            row[
+                key
+            ]
+
+            for key in [
+                "Direction",
+                "Score",
+                "PreviousHA",
+                "PreviousSAR",
+                "BBStress",
+                "BBExtreme",
+                "BBRetreat",
+                "HAIndecision",
+                "HAFlip",
+                "HANewColor",
+                "SARNewDirection",
+                "SARNear",
+                "SARRecentFlip",
+                "BBMidCross",
+                "Reasons",
+            ]
+        }
+
+        rules = rules_from_sequence(
+            sequence
+        )
+
+        for rule in rules:
+
+            rows.append(
+                {
+                    "Ticker":
+                        row[
+                            "Ticker"
+                        ],
+
+                    "Date":
+                        row[
+                            "Date"
+                        ],
+
+                    "Direction":
+                        row[
+                            "Direction"
+                        ],
+
+                    "Rule":
+                        rule,
+
+                    "Score":
+                        row[
+                            "Score"
+                        ],
+
+                    "Reasons":
+                        row[
+                            "Reasons"
+                        ],
+
+                    "PreviousHA":
+                        row[
+                            "PreviousHA"
+                        ],
+
+                    "PreviousSAR":
+                        row[
+                            "PreviousSAR"
+                        ],
+
+                    "BBStress":
+                        row[
+                            "BBStress"
+                        ],
+
+                    "BBRetreat":
+                        row[
+                            "BBRetreat"
+                        ],
+
+                    "HAFlip":
+                        row[
+                            "HAFlip"
+                        ],
+
+                    "HAIndecision":
+                        row[
+                            "HAIndecision"
+                        ],
+
+                    "SARNewDirection":
+                        row[
+                            "SARNewDirection"
+                        ],
+
+                    "SARNear":
+                        row[
+                            "SARNear"
+                        ],
+
+                    "SARRecentFlip":
+                        row[
+                            "SARRecentFlip"
+                        ],
+
+                    "BBMidCross":
+                        row[
+                            "BBMidCross"
+                        ],
+                }
+            )
+
+    if not rows:
+
+        return pd.DataFrame()
+
+    return pd.DataFrame(
+        rows
+    )
+
+
+# ============================================================
+# COOLDOWN
+#
+# Se una regola rimane attiva per più settimane,
+# teniamo solo il primo segnale.
+# ============================================================
+
+def apply_cooldown(
+    events
+):
+
+    if events.empty:
+
+        return events
+
+    events = (
+        events
+        .sort_values(
+            [
+                "Ticker",
+                "Rule",
+                "Direction",
+                "Date",
+            ]
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+    keep = []
+
+    last_dates = {}
+
+    for index, row in (
+        events.iterrows()
+    ):
+
+        key = (
+            row[
+                "Ticker"
+            ],
+            row[
+                "Rule"
+            ],
+            row[
+                "Direction"
+            ],
+        )
+
+        current_date = (
+            normalize_timestamp(
+                row[
+                    "Date"
+                ]
+            )
+        )
+
+        previous_date = (
+            last_dates.get(
+                key
+            )
+        )
+
+        if previous_date is None:
+
+            keep.append(
+                index
+            )
+
+            last_dates[
+                key
+            ] = current_date
+
+            continue
+
+        weeks = (
+            (
+                current_date
+                -
+                previous_date
+            ).days
+            /
+            7.0
+        )
+
+        if weeks > SIGNAL_COOLDOWN_WEEKS:
+
+            keep.append(
+                index
+            )
+
+            last_dates[
+                key
+            ] = current_date
+
+    return (
+        events.loc[
+            keep
+        ]
+        .reset_index(
+            drop=True
+        )
+    )
+
+
+# ============================================================
+# LIMITIAMO EVENTI ALL'INTERVALLO COPERTO DAL GROUND TRUTH
+# ============================================================
+
+def trim_to_ground_truth_period(
+    events,
+    ground_truth
+):
+
+    if events.empty:
+
+        return events
+
+    parts = []
+
+    for ticker in TICKERS:
+
+        ticker_gt = ground_truth[
+            ground_truth[
+                "Ticker"
+            ]
+            ==
+            ticker
+        ]
+
+        if ticker_gt.empty:
+            continue
+
+        minimum_date = (
+            ticker_gt[
+                "PivotDate"
+            ].min()
+            -
+            pd.Timedelta(
+                weeks=2
+            )
+        )
+
+        maximum_date = (
+            ticker_gt[
+                "PivotDate"
+            ].max()
+            +
+            pd.Timedelta(
+                weeks=2
+            )
+        )
+
+        ticker_events = events[
+            (
+                events[
+                    "Ticker"
+                ]
+                ==
+                ticker
+            )
+            &
+            (
+                events[
+                    "Date"
+                ]
+                >=
+                minimum_date
+            )
+            &
+            (
+                events[
+                    "Date"
+                ]
+                <=
+                maximum_date
+            )
+        ].copy()
+
+        parts.append(
+            ticker_events
+        )
+
+    if not parts:
+
+        return pd.DataFrame()
+
+    return pd.concat(
+        parts,
+        ignore_index=True
+    )
+
+
+# ============================================================
+# MATCH ONE-TO-ONE
+#
+# ATTENZIONE:
+#
+# Ogni RULE viene valutata separatamente.
+#
+# Quindi SCORE_60 non "ruba" un pivot
+# a HA_BB_SAR.
+# ============================================================
+
+def match_rule_group(
+    group,
+    ground_truth
+):
+
+    result = group.copy()
+
+    result[
+        "Matched"
+    ] = False
+
+    result[
+        "MatchedPivotDate"
+    ] = pd.Series(
+        pd.NaT,
+        index=result.index,
+        dtype="datetime64[ns, UTC]"
+    )
+
+    result[
+        "LagWeeks"
+    ] = np.nan
+
+    used_pivots = set()
+
+    result = (
+        result
+        .sort_values(
+            "Date"
+        )
+    )
+
+    for index, event in (
+        result.iterrows()
+    ):
+
+        ticker = event[
+            "Ticker"
+        ]
+
+        direction = event[
+            "Direction"
+        ]
+
+        event_date = (
+            normalize_timestamp(
+                event[
+                    "Date"
+                ]
+            )
+        )
+
+        candidates = ground_truth[
+            (
+                ground_truth[
+                    "Ticker"
+                ]
+                ==
+                ticker
+            )
+            &
+            (
+                ground_truth[
+                    "Direction"
+                ]
+                ==
+                direction
+            )
+        ]
+
+        possible = []
+
+        for gt_index, pivot in (
+            candidates.iterrows()
+        ):
+
+            key = (
+                ticker,
+                gt_index,
+            )
+
+            if key in used_pivots:
+                continue
+
+            pivot_date = (
+                normalize_timestamp(
+                    pivot[
+                        "PivotDate"
+                    ]
+                )
+            )
+
+            lag = (
+                event_date
+                -
+                pivot_date
+            ).days / 7.0
+
+            if (
+                lag
+                >=
+                -MATCH_WEEKS_BEFORE
+                and
+                lag
+                <=
+                MATCH_WEEKS_AFTER
+            ):
+
+                possible.append(
+                    (
+                        abs(
+                            lag
+                        ),
+                        gt_index,
+                        pivot_date,
+                        lag,
+                    )
+                )
+
+        if not possible:
+            continue
+
+        possible.sort(
+            key=lambda item:
+            item[
+                0
+            ]
+        )
+
+        (
+            _,
+            gt_index,
+            pivot_date,
+            lag,
+        ) = possible[
+            0
+        ]
+
+        used_pivots.add(
+            (
+                ticker,
+                gt_index,
+            )
+        )
+
+        result.at[
+            index,
+            "Matched"
+        ] = True
+
+        result.at[
+            index,
+            "MatchedPivotDate"
+        ] = pivot_date
+
+        result.at[
+            index,
+            "LagWeeks"
+        ] = lag
+
+    return result
+
+
+def match_all_events(
+    events,
+    ground_truth
+):
+
+    if events.empty:
+
+        return events
+
+    groups = []
+
+    for (
+        ticker,
+        rule,
+        direction
+    ), group in events.groupby(
+        [
+            "Ticker",
+            "Rule",
+            "Direction",
+        ]
+    ):
+
+        matched = match_rule_group(
+            group,
+            ground_truth
+        )
+
+        groups.append(
+            matched
+        )
+
+    return pd.concat(
+        groups,
+        ignore_index=True
+    )
+
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+def build_summary(
+    events,
+    ground_truth
+):
+
+    rows = []
+
+    rules = sorted(
+        events[
+            "Rule"
+        ].unique()
+    )
+
+    for rule in rules:
+
+        for ticker in (
+            TICKERS
+            +
+            [
+                "ALL",
+            ]
+        ):
+
+            for direction in [
+                "BUY",
+                "SELL",
+                "ALL",
+            ]:
+
+                if ticker == "ALL":
+
+                    e = events[
+                        events[
+                            "Rule"
+                        ]
+                        ==
+                        rule
+                    ]
+
+                    gt = ground_truth.copy()
+
+                else:
+
+                    e = events[
+                        (
+                            events[
+                                "Rule"
+                            ]
+                            ==
+                            rule
+                        )
+                        &
+                        (
+                            events[
+                                "Ticker"
+                            ]
+                            ==
+                            ticker
+                        )
+                    ]
+
+                    gt = ground_truth[
+                        ground_truth[
+                            "Ticker"
+                        ]
+                        ==
+                        ticker
+                    ]
+
+                if direction != "ALL":
+
+                    e = e[
+                        e[
+                            "Direction"
+                        ]
+                        ==
+                        direction
+                    ]
+
+                    gt = gt[
+                        gt[
+                            "Direction"
+                        ]
+                        ==
+                        direction
+                    ]
+
+                total_signals = len(
+                    e
+                )
+
+                correct_signals = int(
+                    e[
+                        "Matched"
+                    ]
+                    .fillna(False)
+                    .sum()
+                )
+
+                false_signals = (
+                    total_signals
+                    -
+                    correct_signals
+                )
+
+                true_pivots = len(
+                    gt
+                )
+
+                precision = pct(
+                    correct_signals,
+                    total_signals
+                )
+
+                recall = pct(
+                    correct_signals,
+                    true_pivots
+                )
+
+                if (
+                    np.isfinite(
+                        precision
+                    )
+                    and
+                    np.isfinite(
+                        recall
+                    )
+                    and
+                    (
+                        precision
+                        +
+                        recall
+                    )
+                    >
+                    0
+                ):
+
+                    f1 = (
+                        2
+                        *
+                        precision
+                        *
+                        recall
+                        /
+                        (
+                            precision
+                            +
+                            recall
+                        )
+                    )
+
+                else:
+
+                    f1 = np.nan
+
+                matched_rows = e[
+                    e[
+                        "Matched"
+                    ]
+                    ==
+                    True
+                ]
+
+                average_lag = (
+                    matched_rows[
+                        "LagWeeks"
+                    ].mean()
+                    if
+                    not matched_rows.empty
+                    else
+                    np.nan
+                )
+
+                median_lag = (
+                    matched_rows[
+                        "LagWeeks"
+                    ].median()
+                    if
+                    not matched_rows.empty
+                    else
+                    np.nan
+                )
+
+                average_score = (
+                    e[
+                        "Score"
+                    ].mean()
+                    if
+                    not e.empty
+                    else
+                    np.nan
+                )
+
+                rows.append(
+                    {
+                        "Rule":
+                            rule,
+
+                        "Ticker":
+                            ticker,
+
+                        "Direction":
+                            direction,
+
+                        "TruePivots":
+                            true_pivots,
+
+                        "Signals":
+                            total_signals,
+
+                        "CorrectSignals":
+                            correct_signals,
+
+                        "FalseSignals":
+                            false_signals,
+
+                        "PrecisionPct":
+                            precision,
+
+                        "RecallPct":
+                            recall,
+
+                        "F1Pct":
+                            f1,
+
+                        "AverageLagWeeks":
+                            average_lag,
+
+                        "MedianLagWeeks":
+                            median_lag,
+
+                        "AverageScore":
+                            average_score,
+                    }
+                )
+
+    return pd.DataFrame(
+        rows
+    )
+
+
+# ============================================================
+# STAMPA
+# ============================================================
+
+def print_main_summary(
+    summary
+):
+
+    print()
+    print(
+        "=" * 100
+    )
+    print(
+        "RISULTATI WEEKLY PHASE 1 - SEQUENCE V1"
+    )
+    print(
+        "=" * 100
+    )
+
+    overall = summary[
+        (
+            summary[
+                "Ticker"
+            ]
+            ==
+            "ALL"
+        )
+        &
+        (
+            summary[
+                "Direction"
+            ]
+            ==
+            "ALL"
+        )
+    ].copy()
+
+    overall = (
+        overall
+        .sort_values(
+            [
+                "PrecisionPct",
+                "RecallPct",
+            ],
+            ascending=[
+                False,
+                False,
+            ]
+        )
+    )
+
+    columns = [
+        "Rule",
+        "TruePivots",
+        "Signals",
+        "CorrectSignals",
+        "FalseSignals",
+        "PrecisionPct",
+        "RecallPct",
+        "F1Pct",
+        "AverageLagWeeks",
+    ]
+
+    print(
+        overall[
+            columns
+        ]
+        .to_string(
+            index=False
+        )
+    )
+
+    print()
+    print(
+        "=" * 100
+    )
+    print(
+        "BUY / SELL SEPARATI"
+    )
+    print(
+        "=" * 100
+    )
+
+    directional = summary[
+        (
+            summary[
+                "Ticker"
+            ]
+            ==
+            "ALL"
+        )
+        &
+        (
+            summary[
+                "Direction"
+            ]
+            !=
+            "ALL"
+        )
+    ].copy()
+
+    directional = directional[
+        columns[
+            :1
+        ]
+        +
+        [
+            "Direction",
+        ]
+        +
+        columns[
+            1:
+        ]
+    ]
+
+    print(
+        directional
+        .to_string(
+            index=False
+        )
+    )
+
+
+def print_recent_signals(
+    events
+):
+
+    print()
+    print(
+        "=" * 100
+    )
+    print(
+        "ULTIMI SEGNALI PER TITOLO"
+    )
+    print(
+        "=" * 100
+    )
+
+    for ticker in TICKERS:
+
+        print()
+        print(
+            "-" * 100
+        )
+        print(
+            ticker
+        )
+        print(
+            "-" * 100
+        )
+
+        subset = events[
+            events[
+                "Ticker"
+            ]
+            ==
+            ticker
+        ].copy()
+
+        if subset.empty:
+
+            print(
+                "Nessun segnale."
+            )
+
+            continue
+
+        preferred_rules = [
+            "HA_BB",
+            "HA_BB_RETREAT",
+            "HA_BB_SAR",
+            "SEQUENCE_CONTEXT",
+            "SCORE_60",
+            "SCORE_70",
+        ]
+
+        subset = subset[
+            subset[
+                "Rule"
+            ].isin(
+                preferred_rules
+            )
+        ]
+
+        subset = (
+            subset
+            .sort_values(
+                "Date"
+            )
+            .tail(
+                20
+            )
+        )
+
+        columns = [
+            "Date",
+            "Direction",
+            "Rule",
+            "Score",
+            "Matched",
+            "MatchedPivotDate",
+            "LagWeeks",
+            "Reasons",
+        ]
+
+        print(
+            subset[
+                columns
+            ]
+            .to_string(
+                index=False
+            )
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print()
+    print(
+        "=" * 100
+    )
+    print(
+        "MARKET SENTINEL"
+    )
+    print(
+        "WEEKLY PHASE 1 - SEQUENCE V1"
+    )
+    print(
+        "=" * 100
+    )
+
+    print()
+    print(
+        "Carico Ground Truth V2..."
+    )
+
+    ground_truth = (
+        load_ground_truth()
+    )
+
+    print(
+        f"Pivot Ground Truth: "
+        f"{len(ground_truth)}"
+    )
+
+    all_features = []
+
+    for ticker in TICKERS:
+
+        print()
+        print(
+            f"Analizzo {ticker}..."
+        )
+
+        data = get_weekly_data(
+            ticker
+        )
+
+        print(
+            f"Weekly disponibili: "
+            f"{len(data)}"
+        )
+
+        data = build_features(
+            data
+        )
+
+        features = (
+            build_sequence_features(
+                ticker,
+                data
+            )
+        )
+
+        all_features.append(
+            features
+        )
+
+    features = pd.concat(
+        all_features,
+        ignore_index=True
+    )
+
+    print()
+    print(
+        f"Osservazioni di sequenza: "
+        f"{len(features)}"
+    )
+
+    events = create_candidate_events(
+        features
+    )
+
+    print(
+        f"Eventi prima del cooldown: "
+        f"{len(events)}"
+    )
+
+    events = apply_cooldown(
+        events
+    )
+
+    print(
+        f"Eventi dopo cooldown: "
+        f"{len(events)}"
+    )
+
+    events = trim_to_ground_truth_period(
+        events,
+        ground_truth
+    )
+
+    print(
+        f"Eventi nel periodo Ground Truth: "
+        f"{len(events)}"
+    )
+
+    matched_events = (
+        match_all_events(
+            events,
+            ground_truth
+        )
+    )
+
+    summary = build_summary(
+        matched_events,
+        ground_truth
+    )
+
+    os.makedirs(
+        "data",
+        exist_ok=True
+    )
+
+    features.to_csv(
+        OUTPUT_FEATURES_FILE,
+        index=False
+    )
+
+    matched_events.to_csv(
+        OUTPUT_EVENTS_FILE,
+        index=False
+    )
+
+    summary.to_csv(
+        OUTPUT_SUMMARY_FILE,
+        index=False
+    )
+
+    print_main_summary(
+        summary
+    )
+
+    print_recent_signals(
+        matched_events
+    )
+
+    print()
+    print(
+        "=" * 100
+    )
+    print(
+        "FILE SALVATI"
+    )
+    print(
+        "=" * 100
+    )
+
+    print(
+        OUTPUT_FEATURES_FILE
+    )
+
+    print(
+        OUTPUT_EVENTS_FILE
+    )
+
+    print(
+        OUTPUT_SUMMARY_FILE
+    )
+
+    print()
+    print(
+        "TEST COMPLETATO."
+    )
+
+
+if __name__ == "__main__":
+
+    main()import numpy as np
+import pandas as pd
+
+from weekly_phase1_sequence_v1 import get_weekly_data
+
+
+INPUT_FILE = "data/weekly_phase1_progressive_diagnostic_v2.csv"
+OUTPUT_FILE = "data/weekly_phase1_sell_pressure_v3.csv"
+
+TICKERS = [
+    "LDO.MI",
+    "UCG.MI",
+    "ENI.MI",
+    "ENEL.MI",
+    "ISP.MI",
+    "SPM.MI",
+]
+
+
+def prepare_weekly(ticker):
+
+    df = get_weekly_data(ticker).copy()
+
+    # --------------------------------------------------------
+    # Normalizzazione colonne
+    # --------------------------------------------------------
+
+    if isinstance(df.columns, pd.MultiIndex):
+
+        # Cerca il livello che contiene OHLCV
+        new_columns = []
+
+        for col in df.columns:
+
+            parts = [
+                str(x)
+                for x in col
+                if str(x) != ""
+            ]
+
+            found = None
+
+            for part in parts:
+
+                if part.lower() in [
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume"
+                ]:
+                    found = part.title()
+                    break
+
+            if found is None:
+                found = str(col[-1])
+
+            new_columns.append(found)
+
+        df.columns = new_columns
+
+    rename = {}
+
+    for col in df.columns:
+
+        c = str(col).lower()
+
+        if c == "open":
+            rename[col] = "Open"
+
+        elif c == "high":
+            rename[col] = "High"
+
+        elif c == "low":
+            rename[col] = "Low"
+
+        elif c == "close":
+            rename[col] = "Close"
+
+        elif c == "volume":
+            rename[col] = "Volume"
+
+    df = df.rename(
+        columns=rename
+    )
+
+    required = [
+        "High",
+        "Low",
+        "Close",
+        "Volume"
+    ]
+
+    missing = [
+        x
+        for x in required
+        if x not in df.columns
+    ]
+
+    if missing:
+
+        raise ValueError(
+            f"{ticker}: colonne mancanti {missing}. "
+            f"Disponibili: {list(df.columns)}"
+        )
+
+    # --------------------------------------------------------
+    # Date
+    # --------------------------------------------------------
+
+    if not isinstance(
+        df.index,
+        pd.DatetimeIndex
+    ):
+
+        if "Date" in df.columns:
+
+            df["Date"] = pd.to_datetime(
+                df["Date"],
+                utc=True,
+                errors="coerce"
+            )
+
+            df = df.set_index(
+                "Date"
+            )
+
+        else:
+
+            raise ValueError(
+                f"{ticker}: indice non temporale."
+            )
+
+    idx = pd.to_datetime(
+        df.index,
+        utc=True,
+        errors="coerce"
+    )
+
+    df.index = idx
+
+    df = (
+        df[
+            ~df.index.isna()
+        ]
+        .sort_index()
+        .copy()
+    )
+
+    # --------------------------------------------------------
+    # Numerici
+    # --------------------------------------------------------
+
+    for col in required:
+
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce"
+        )
+
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+    volume = df["Volume"]
+
+    # ========================================================
+    # ACCUMULATION / DISTRIBUTION
+    # ========================================================
+
+    price_range = (
+        high
+        -
+        low
+    )
+
+    mfm = np.where(
+        price_range.abs() > 1e-12,
+
+        (
+            (
+                close
+                -
+                low
+            )
+            -
+            (
+                high
+                -
+                close
+            )
+        )
+        /
+        price_range,
+
+        0.0
+    )
+
+    df["MFM"] = mfm
+
+    df["MFV"] = (
+        df["MFM"]
+        *
+        volume
+    )
+
+    df["AD"] = (
+        df["MFV"]
+        .fillna(0)
+        .cumsum()
+    )
+
+    # Normalizzazione per rendere confrontabili i titoli
+    flow_scale = (
+        df["MFV"]
+        .abs()
+        .rolling(
+            20,
+            min_periods=8
+        )
+        .mean()
+        .replace(
+            0,
+            np.nan
+        )
+    )
+
+    df["AD_Delta1"] = (
+        df["AD"].diff()
+        /
+        flow_scale
+    )
+
+    df["AD_Slope2"] = (
+        (
+            df["AD"]
+            -
+            df["AD"].shift(2)
+        )
+        /
+        (
+            2
+            *
+            flow_scale
+        )
+    )
+
+    df["AD_Slope4"] = (
+        (
+            df["AD"]
+            -
+            df["AD"].shift(4)
+        )
+        /
+        (
+            4
+            *
+            flow_scale
+        )
+    )
+
+    df["AD_Accel"] = (
+        df["AD_Delta1"]
+        -
+        df["AD_Delta1"].shift(1)
+    )
+
+    # ========================================================
+    # CHAIKIN OSCILLATOR
+    # ========================================================
+
+    ema3 = (
+        df["AD"]
+        .ewm(
+            span=3,
+            adjust=False
+        )
+        .mean()
+    )
+
+    ema10 = (
+        df["AD"]
+        .ewm(
+            span=10,
+            adjust=False
+        )
+        .mean()
+    )
+
+    chaikin_raw = (
+        ema3
+        -
+        ema10
+    )
+
+    df["Chaikin"] = (
+        chaikin_raw
+        /
+        flow_scale
+    )
+
+    df["Chaikin_Delta1"] = (
+        df["Chaikin"]
+        .diff()
+    )
+
+    df["Chaikin_Slope2"] = (
+        (
+            df["Chaikin"]
+            -
+            df["Chaikin"].shift(2)
+        )
+        /
+        2
+    )
+
+    df["Chaikin_Slope4"] = (
+        (
+            df["Chaikin"]
+            -
+            df["Chaikin"].shift(4)
+        )
+        /
+        4
+    )
+
+    df["Chaikin_Accel"] = (
+        df["Chaikin_Delta1"]
+        -
+        df["Chaikin_Delta1"].shift(1)
+    )
+
+    # ========================================================
+    # VOLUME
+    # ========================================================
+
+    volume_median20 = (
+        volume
+        .rolling(
+            20,
+            min_periods=8
+        )
+        .median()
+        .replace(
+            0,
+            np.nan
+        )
+    )
+
+    df["VolumeRatio20"] = (
+        volume
+        /
+        volume_median20
+    )
+
+    log_volume = np.log(
+        volume.replace(
+            0,
+            np.nan
+        )
+    )
+
+    df["VolumeTrend4"] = (
+        (
+            log_volume
+            -
+            log_volume.shift(4)
+        )
+        /
+        4
+    )
+
+    # ========================================================
+    # PRICE + VOLUME
+    # ========================================================
+
+    df["Return1"] = (
+        close.pct_change()
+    )
+
+    df["Return4"] = (
+        close
+        /
+        close.shift(4)
+        -
+        1
+    )
+
+    df["SignedVolume1"] = (
+        np.sign(
+            df["Return1"]
+        )
+        *
+        df["VolumeRatio20"]
+    )
+
+    df["SignedVolume4"] = (
+        df["SignedVolume1"]
+        .rolling(
+            4,
+            min_periods=2
+        )
+        .mean()
+    )
+
+    return df
+
+
+def attach_features(
+    events,
+    ticker,
+    weekly
+):
+
+    rows = []
+
+    ticker_events = events[
+        events["Ticker"]
+        ==
+        ticker
+    ].copy()
+
+    for _, event in ticker_events.iterrows():
+
+        event_date = pd.Timestamp(
+            event["Date"]
+        )
+
+        if event_date.tzinfo is None:
+
+            event_date = (
+                event_date
+                .tz_localize(
+                    "UTC"
+                )
+            )
+
+        else:
+
+            event_date = (
+                event_date
+                .tz_convert(
+                    "UTC"
+                )
+            )
+
+        # Ultima barra disponibile ALLA DATA DEL SEGNALE.
+        # Nessuna informazione futura.
+        pos = weekly.index.searchsorted(
+            event_date,
+            side="right"
+        ) - 1
+
+        if pos < 0:
+            continue
+
+        bar = weekly.iloc[
+            pos
+        ]
+
+        row = event.to_dict()
+
+        row[
+            "FeatureDate"
+        ] = weekly.index[
+            pos
+        ]
+
+        feature_columns = [
+            "AD_Delta1",
+            "AD_Slope2",
+            "AD_Slope4",
+            "AD_Accel",
+
+            "Chaikin",
+            "Chaikin_Delta1",
+            "Chaikin_Slope2",
+            "Chaikin_Slope4",
+            "Chaikin_Accel",
+
+            "VolumeRatio20",
+            "VolumeTrend4",
+
+            "Return1",
+            "Return4",
+
+            "SignedVolume1",
+            "SignedVolume4",
+        ]
+
+        for col in feature_columns:
+
+            row[col] = bar[
+                col
+            ]
+
+        rows.append(
+            row
+        )
+
+    return rows
+
+
+def compare(
+    df,
+    feature
+):
+
+    correct = df[
+        df["Matched"]
+    ][feature].dropna()
+
+    false = df[
+        ~df["Matched"]
+    ][feature].dropna()
+
+    if (
+        correct.empty
+        or
+        false.empty
+    ):
+        return
+
+    print(
+        f"{feature:22s} | "
+        f"CORRECT mean={correct.mean():8.4f} "
+        f"med={correct.median():8.4f} | "
+        f"FALSE mean={false.mean():8.4f} "
+        f"med={false.median():8.4f}"
+    )
+
+
+def directional_test(
+    df,
+    feature,
+    operator
+):
+
+    if operator == "<0":
+
+        condition = (
+            df[feature]
+            <
+            0
+        )
+
+    elif operator == ">0":
+
+        condition = (
+            df[feature]
+            >
+            0
+        )
+
+    else:
+        return
+
+    x = df[
+        condition
+    ]
+
+    n = len(
+        x
+    )
+
+    if n == 0:
+        return
+
+    ok = int(
+        x["Matched"].sum()
+    )
+
+    precision = (
+        ok
+        /
+        n
+        *
+        100
+    )
+
+    print(
+        f"{feature:22s} {operator:3s} | "
+        f"signals={n:2d} "
+        f"correct={ok:2d} "
+        f"false={n-ok:2d} "
+        f"precision={precision:6.2f}%"
+    )
+
+
+def main():
+
+    print()
+    print("=" * 120)
+    print("MARKET SENTINEL")
+    print("SELL PRESSURE DIAGNOSTIC V3")
+    print("CHAIKIN + A/D + VOLUME")
+    print("=" * 120)
+
+    events = pd.read_csv(
+        INPUT_FILE
+    )
+
+    events["Ticker"] = (
+        events["Ticker"]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
+
+    events["Direction"] = (
+        events["Direction"]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+    )
+
+    events["Date"] = pd.to_datetime(
+        events["Date"],
+        utc=True,
+        errors="coerce"
+    )
+
+    events["Matched"] = (
+        events["Matched"]
+        .astype(str)
+        .str.lower()
+        .eq(
+            "true"
+        )
+    )
+
+    # ========================================================
+    # IL CAMPIONE SELL CHE STIAMO STUDIANDO
+    # ========================================================
+
+    sell = events[
+        (
+            events["Direction"]
+            ==
+            "SELL"
+        )
+        &
+        (
+            events["HAIndecision"]
+            ==
+            0
+        )
+        &
+        (
+            events["PreviousHA"]
+            >=
+            3
+        )
+        &
+        (
+            events["PreviousSAR"]
+            >=
+            1
+        )
+    ].copy()
+
+    print()
+    print(
+        f"SELL di partenza: "
+        f"{len(sell)}"
+    )
+
+    print(
+        f"Corretti: "
+        f"{int(sell['Matched'].sum())}"
+    )
+
+    print(
+        f"Falsi: "
+        f"{len(sell) - int(sell['Matched'].sum())}"
+    )
+
+    all_rows = []
+
+    for ticker in TICKERS:
+
+        print(
+            f"Elaborazione {ticker}..."
+        )
+
+        weekly = prepare_weekly(
+            ticker
+        )
+
+        rows = attach_features(
+            sell,
+            ticker,
+            weekly
+        )
+
+        all_rows.extend(
+            rows
+        )
+
+    result = pd.DataFrame(
+        all_rows
+    )
+
+    print()
+    print("=" * 120)
+    print("CONFRONTO CORRETTI VS FALSI")
+    print("=" * 120)
+
+    features = [
+        "AD_Delta1",
+        "AD_Slope2",
+        "AD_Slope4",
+        "AD_Accel",
+
+        "Chaikin",
+        "Chaikin_Delta1",
+        "Chaikin_Slope2",
+        "Chaikin_Slope4",
+        "Chaikin_Accel",
+
+        "VolumeRatio20",
+        "VolumeTrend4",
+
+        "Return1",
+        "Return4",
+
+        "SignedVolume1",
+        "SignedVolume4",
+    ]
+
+    for feature in features:
+
+        compare(
+            result,
+            feature
+        )
+
+    # ========================================================
+    # TEST DIREZIONALI NATURALI
+    #
+    # Per SELL:
+    # pressione negativa = coerente con perdita di forza.
+    #
+    # NON stiamo ottimizzando soglie numeriche.
+    # Guardiamo semplicemente il segno.
+    # ========================================================
+
+    print()
+    print("=" * 120)
+    print("TEST PRESSIONE NEGATIVA - SELL")
+    print("=" * 120)
+
+    directional_features = [
+        "AD_Delta1",
+        "AD_Slope2",
+        "AD_Slope4",
+        "AD_Accel",
+
+        "Chaikin",
+        "Chaikin_Delta1",
+        "Chaikin_Slope2",
+        "Chaikin_Slope4",
+        "Chaikin_Accel",
+
+        "SignedVolume1",
+        "SignedVolume4",
+    ]
+
+    for feature in directional_features:
+
+        directional_test(
+            result,
+            feature,
+            "<0"
+        )
+
+    # ========================================================
+    # COMBINAZIONI LOGICHE
+    # ========================================================
+
+    print()
+    print("=" * 120)
+    print("COMBINAZIONI CHAIKIN + A/D")
+    print("=" * 120)
+
+    combinations = {
+
+        "AD1 + CHAIKIN1":
+            (
+                (result["AD_Delta1"] < 0)
+                &
+                (result["Chaikin_Delta1"] < 0)
+            ),
+
+        "AD2 + CHAIKIN2":
+            (
+                (result["AD_Slope2"] < 0)
+                &
+                (result["Chaikin_Slope2"] < 0)
+            ),
+
+        "AD4 + CHAIKIN4":
+            (
+                (result["AD_Slope4"] < 0)
+                &
+                (result["Chaikin_Slope4"] < 0)
+            ),
+
+        "CHAIKIN NEG + FALLING":
+            (
+                (result["Chaikin"] < 0)
+                &
+                (result["Chaikin_Delta1"] < 0)
+            ),
+
+        "AD4 + CH4 + SV4":
+            (
+                (result["AD_Slope4"] < 0)
+                &
+                (result["Chaikin_Slope4"] < 0)
+                &
+                (result["SignedVolume4"] < 0)
+            ),
+    }
+
+    for name, condition in combinations.items():
+
+        x = result[
+            condition
+        ]
+
+        n = len(
+            x
+        )
+
+        if n == 0:
+            continue
+
+        ok = int(
+            x["Matched"].sum()
+        )
+
+        print(
+            f"{name:25s} | "
+            f"signals={n:2d} "
+            f"correct={ok:2d} "
+            f"false={n-ok:2d} "
+            f"precision={ok/n*100:6.2f}%"
+        )
+
+    # ========================================================
+    # DETTAGLIO DEI 25 EVENTI
+    # ========================================================
+
+    print()
+    print("=" * 120)
+    print("DETTAGLIO EVENTI")
+    print("=" * 120)
+
+    detail_columns = [
+        "Ticker",
+        "Date",
+        "Matched",
+        "AD_Delta1",
+        "AD_Slope4",
+        "Chaikin",
+        "Chaikin_Delta1",
+        "Chaikin_Slope4",
+        "VolumeRatio20",
+        "SignedVolume4",
+    ]
+
+    print(
+        result[
+            detail_columns
+        ]
+        .sort_values(
+            [
+                "Matched",
+                "Ticker",
+                "Date",
+            ]
+        )
+        .to_string(
+            index=False
+        )
+    )
+
+    result.to_csv(
+        OUTPUT_FILE,
+        index=False
+    )
+
+    print()
+    print("=" * 120)
+    print("FILE CREATO")
+    print("=" * 120)
+    print(
+        OUTPUT_FILE
+    )
+
+
+if __name__ == "__main__":
+    main()import pandas as pd
+import numpy as np
+
+from weekly_phase1_sell_pressure_v3 import prepare_weekly
+
+
+# ============================================================
+# MARKET SENTINEL
+# WEEKLY PHASE 1
+# SELL DYNAMIC CONTEXT V6C
+#
+# MACD + HISTOGRAM + VOLUME OSCILLATOR
+# letti come TRAIETTORIA / FASE, non come valore statico.
+#
+# Nessuna modifica al modello.
+# Nessuna ottimizzazione di soglie.
+# ============================================================
+
+INPUT_FILE = "data/weekly_phase1_sell_volume_oscillator_v6b.csv"
+OUTPUT_FILE = "data/weekly_phase1_sell_dynamic_context_v6c.csv"
+
+VOL_FAST = 5
+VOL_SLOW = 20
+
+TICKERS = [
+    "LDO.MI", "UCG.MI", "ENI.MI",
+    "ENEL.MI", "ISP.MI", "SPM.MI",
+    "G.MI", "STLAM.MI", "TRN.MI",
+]
+
+
+def to_bool(s):
+    if s.dtype == bool:
+        return s
+    return s.astype(str).str.lower().eq("true")
+
+
+def stats(label, df):
+    n = len(df)
+
+    if not n:
+        print(f"{label:48s} | 0")
+        return
+
+    ok = int(df["Matched"].sum())
+    p = ok / n * 100
+
+    old = df[df["Sample"] == "PREVIOUS_6"]
+    new = df[df["Sample"] == "NEW_3"]
+
+    old_ok = int(old["Matched"].sum())
+    new_ok = int(new["Matched"].sum())
+
+    old_p = old_ok / len(old) * 100 if len(old) else np.nan
+    new_p = new_ok / len(new) * 100 if len(new) else np.nan
+
+    old_txt = f"{old_ok}/{len(old)} {old_p:.1f}%" if len(old) else "-"
+    new_txt = f"{new_ok}/{len(new)} {new_p:.1f}%" if len(new) else "-"
+
+    print(
+        f"{label:48s} | "
+        f"ALL {ok:2d}/{n:2d} {p:6.2f}% | "
+        f"OLD {old_txt:12s} | "
+        f"NEW {new_txt:12s}"
+    )
+
+
+# ============================================================
+# INDICATORI + CONTESTO DINAMICO
+# ============================================================
+
+def build_dynamic_features(weekly):
+
+    df = weekly.copy()
+
+    close = pd.to_numeric(df["Close"], errors="coerce")
+    volume = pd.to_numeric(df["Volume"], errors="coerce")
+
+    # --------------------------------------------------------
+    # MACD 12/26/9
+    # --------------------------------------------------------
+
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    hist = macd - signal
+
+    scale = close.abs().replace(0, np.nan)
+
+    df["MACD_CTX"] = macd / scale * 100
+    df["HIST_CTX"] = hist / scale * 100
+
+    # --------------------------------------------------------
+    # VOLUME OSCILLATOR 5/20
+    # --------------------------------------------------------
+
+    vf = volume.ewm(span=VOL_FAST, adjust=False).mean()
+    vs = volume.ewm(span=VOL_SLOW, adjust=False).mean()
+
+    df["VO_CTX"] = (
+        (vf - vs)
+        / vs.replace(0, np.nan)
+        * 100
+    )
+
+    # ========================================================
+    # FUNZIONE PER DESCRIVERE UNA TRAIETTORIA
+    # ========================================================
+
+    def add_context(prefix, series):
+
+        # ----------------------------------------------------
+        # MOVIMENTO 2 / 4 / 6 / 8 SETTIMANE
+        # ----------------------------------------------------
+
+        for w in [2, 4, 6, 8]:
+
+            df[f"{prefix}_Change{w}"] = (
+                series - series.shift(w)
+            )
+
+            df[f"{prefix}_Slope{w}"] = (
+                (
+                    series
+                    -
+                    series.shift(w)
+                )
+                /
+                w
+            )
+
+        # ----------------------------------------------------
+        # VELOCITÀ E ACCELERAZIONE
+        # ----------------------------------------------------
+
+        delta1 = series.diff()
+
+        df[f"{prefix}_Delta1"] = delta1
+
+        df[f"{prefix}_Accel"] = (
+            delta1
+            -
+            delta1.shift(1)
+        )
+
+        # ----------------------------------------------------
+        # MASSIMO / MINIMO PRECEDENTI
+        #
+        # shift(1) IMPORTANTISSIMO:
+        # il riferimento viene dalle settimane precedenti.
+        # ----------------------------------------------------
+
+        for w in [4, 8, 12]:
+
+            previous = series.shift(1)
+
+            recent_max = previous.rolling(
+                w,
+                min_periods=2
+            ).max()
+
+            recent_min = previous.rolling(
+                w,
+                min_periods=2
+            ).min()
+
+            df[f"{prefix}_PrevMax{w}"] = recent_max
+            df[f"{prefix}_PrevMin{w}"] = recent_min
+
+            # Distanza assoluta dal massimo/minimo precedente
+            df[f"{prefix}_FromMax{w}"] = (
+                series
+                -
+                recent_max
+            )
+
+            df[f"{prefix}_FromMin{w}"] = (
+                series
+                -
+                recent_min
+            )
+
+            # ------------------------------------------------
+            # POSIZIONE NEL RANGE RECENTE 0...1
+            #
+            # 1 = vicino al massimo recente
+            # 0 = vicino al minimo recente
+            # ------------------------------------------------
+
+            rng = (
+                recent_max
+                -
+                recent_min
+            ).replace(0, np.nan)
+
+            df[f"{prefix}_RangePos{w}"] = (
+                (
+                    series
+                    -
+                    recent_min
+                )
+                /
+                rng
+            )
+
+        # ----------------------------------------------------
+        # TURNING POINT
+        #
+        # Da salita a discesa oppure viceversa.
+        # ----------------------------------------------------
+
+        previous_delta = delta1.shift(1)
+
+        df[f"{prefix}_TurnDown"] = (
+            (previous_delta > 0)
+            &
+            (delta1 < 0)
+        )
+
+        df[f"{prefix}_TurnUp"] = (
+            (previous_delta < 0)
+            &
+            (delta1 > 0)
+        )
+
+        # ----------------------------------------------------
+        # FASE:
+        #
+        # Rising:
+        #   sale sia nel breve sia nel medio.
+        #
+        # Falling:
+        #   scende sia nel breve sia nel medio.
+        #
+        # RollingOver:
+        #   medio periodo ancora positivo,
+        #   ma breve periodo già negativo.
+        #
+        # Recovering:
+        #   medio periodo negativo,
+        #   breve periodo positivo.
+        # ----------------------------------------------------
+
+        slope2 = (
+            series
+            -
+            series.shift(2)
+        ) / 2
+
+        slope6 = (
+            series
+            -
+            series.shift(6)
+        ) / 6
+
+        conditions = [
+            (slope2 > 0) & (slope6 > 0),
+            (slope2 < 0) & (slope6 < 0),
+            (slope2 < 0) & (slope6 >= 0),
+            (slope2 > 0) & (slope6 <= 0),
+        ]
+
+        choices = [
+            "RISING",
+            "FALLING",
+            "ROLLING_OVER",
+            "RECOVERING",
+        ]
+
+        df[f"{prefix}_Phase"] = np.select(
+            conditions,
+            choices,
+            default="FLAT"
+        )
+
+        # ----------------------------------------------------
+        # PERSISTENZA:
+        # quante delle ultime 4 variazioni sono negative.
+        # 0 = nessuna
+        # 4 = tutte
+        # ----------------------------------------------------
+
+        negatives = pd.concat(
+            [
+                delta1.shift(i).lt(0).astype(int)
+                for i in range(4)
+            ],
+            axis=1
+        )
+
+        df[f"{prefix}_NegativePersistence4"] = (
+            negatives.sum(axis=1)
+        )
+
+    # Applichiamo la stessa logica ai tre indicatori
+
+    add_context(
+        "MACD",
+        df["MACD_CTX"]
+    )
+
+    add_context(
+        "HIST",
+        df["HIST_CTX"]
+    )
+
+    add_context(
+        "VO",
+        df["VO_CTX"]
+    )
+
+    # ========================================================
+    # DIVERGENZE / DISALLINEAMENTI
+    # ========================================================
+
+    price4 = close.pct_change(4)
+
+    df["PriceReturn4_CTX"] = price4
+
+    # Prezzo ancora positivo nelle 4 settimane,
+    # MACD già in deterioramento.
+
+    df["PriceUp_MACDDown4"] = (
+        (price4 > 0)
+        &
+        (df["MACD_Change4"] < 0)
+    )
+
+    # Prezzo ancora positivo,
+    # Histogram in deterioramento.
+
+    df["PriceUp_HISTDown4"] = (
+        (price4 > 0)
+        &
+        (df["HIST_Change4"] < 0)
+    )
+
+    # Prezzo ancora positivo,
+    # Volume Oscillator in deterioramento.
+
+    df["PriceUp_VODown4"] = (
+        (price4 > 0)
+        &
+        (df["VO_Change4"] < 0)
+    )
+
+    # --------------------------------------------------------
+    # DOPPIO DETERIORAMENTO
+    # --------------------------------------------------------
+
+    df["MACD_HIST_Deteriorating"] = (
+        (df["MACD_Delta1"] < 0)
+        &
+        (df["HIST_Delta1"] < 0)
+    )
+
+    df["MACD_VO_Deteriorating"] = (
+        (df["MACD_Delta1"] < 0)
+        &
+        (df["VO_Delta1"] < 0)
+    )
+
+    # --------------------------------------------------------
+    # ROLL-OVER COMBINATO
+    # --------------------------------------------------------
+
+    df["MACD_RollingOver"] = (
+        df["MACD_Phase"]
+        ==
+        "ROLLING_OVER"
+    )
+
+    df["HIST_RollingOver"] = (
+        df["HIST_Phase"]
+        ==
+        "ROLLING_OVER"
+    )
+
+    df["VO_RollingOver"] = (
+        df["VO_Phase"]
+        ==
+        "ROLLING_OVER"
+    )
+
+    return df
+
+
+# ============================================================
+# AGGANCIO AGLI EVENTI
+# ============================================================
+
+def attach(events):
+
+    rows = []
+
+    for ticker in TICKERS:
+
+        ev = events[
+            events["Ticker"] == ticker
+        ].copy()
+
+        if ev.empty:
+            continue
+
+        print(f"Elaborazione {ticker}...")
+
+        weekly = prepare_weekly(ticker)
+        weekly = build_dynamic_features(weekly)
+
+        for _, event in ev.iterrows():
+
+            date = pd.Timestamp(event["Date"])
+
+            if date.tzinfo is None:
+                date = date.tz_localize("UTC")
+            else:
+                date = date.tz_convert("UTC")
+
+            pos = weekly.index.searchsorted(
+                date,
+                side="right"
+            ) - 1
+
+            if pos < 0:
+                continue
+
+            bar = weekly.iloc[pos]
+
+            row = event.to_dict()
+            row["DynamicFeatureDate"] = weekly.index[pos]
+
+            dynamic_columns = [
+                c for c in weekly.columns
+                if (
+                    c.startswith("MACD_")
+                    or c.startswith("HIST_")
+                    or c.startswith("VO_")
+                    or c.startswith("PriceUp_")
+                    or c == "PriceReturn4_CTX"
+                )
+            ]
+
+            for c in dynamic_columns:
+                row[c] = bar[c]
+
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# NUMERIC COMPARISON
+# ============================================================
+
+def compare(df, feature):
+
+    correct = df[df["Matched"]][feature].dropna()
+    false = df[~df["Matched"]][feature].dropna()
+
+    if correct.empty or false.empty:
+        return
+
+    print(
+        f"{feature:32s} | "
+        f"CORRECT mean={correct.mean():8.3f} "
+        f"med={correct.median():8.3f} | "
+        f"FALSE mean={false.mean():8.3f} "
+        f"med={false.median():8.3f}"
+    )
+
+
+# ============================================================
+# PHASE
+# ============================================================
+
+def phase_analysis(df, prefix):
+
+    print()
+    print(f"--- {prefix} PHASE ---")
+
+    for phase in [
+        "RISING",
+        "ROLLING_OVER",
+        "FALLING",
+        "RECOVERING",
+        "FLAT",
+    ]:
+
+        x = df[
+            df[f"{prefix}_Phase"]
+            ==
+            phase
+        ]
+
+        stats(
+            f"{prefix} {phase}",
+            x
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print()
+    print("=" * 125)
+    print("MARKET SENTINEL")
+    print("SELL DYNAMIC CONTEXT V6C")
+    print("MACD + HISTOGRAM + VOLUME OSCILLATOR")
+    print("TRAJECTORY / PHASE / TURNING POINT / DIVERGENCE")
+    print("=" * 125)
+
+    df = pd.read_csv(INPUT_FILE)
+
+    df["Date"] = pd.to_datetime(
+        df["Date"],
+        utc=True
+    )
+
+    df["Matched"] = to_bool(
+        df["Matched"]
+    )
+
+    print()
+    stats("BASE", df)
+
+    print()
+    print("=" * 125)
+    print("CALCOLO CONTESTO DINAMICO")
+    print("=" * 125)
+
+    result = attach(df)
+
+    # ========================================================
+    # TRAIETTORIE
+    # ========================================================
+
+    print()
+    print("=" * 125)
+    print("CORRETTI VS FALSI - TRAIETTORIE")
+    print("=" * 125)
+
+    numeric = [
+        "MACD_Change2",
+        "MACD_Change4",
+        "MACD_Change6",
+        "MACD_Change8",
+        "MACD_Accel",
+        "MACD_FromMax8",
+        "MACD_RangePos8",
+        "MACD_NegativePersistence4",
+
+        "HIST_Change2",
+        "HIST_Change4",
+        "HIST_Change6",
+        "HIST_Change8",
+        "HIST_Accel",
+        "HIST_FromMax8",
+        "HIST_RangePos8",
+        "HIST_NegativePersistence4",
+
+        "VO_Change2",
+        "VO_Change4",
+        "VO_Change6",
+        "VO_Change8",
+        "VO_Accel",
+        "VO_FromMax8",
+        "VO_RangePos8",
+        "VO_NegativePersistence4",
+    ]
+
+    for c in numeric:
+        compare(result, c)
+
+    # ========================================================
+    # FASI
+    # ========================================================
+
+    print()
+    print("=" * 125)
+    print("ANALISI DELLA FASE")
+    print("=" * 125)
+
+    phase_analysis(result, "MACD")
+    phase_analysis(result, "HIST")
+    phase_analysis(result, "VO")
+
+    # ========================================================
+    # TURNING POINT
+    # ========================================================
+
+    print()
+    print("=" * 125)
+    print("TURNING POINT")
+    print("=" * 125)
+
+    for prefix in ["MACD", "HIST", "VO"]:
+
+        stats(
+            f"{prefix} TURN DOWN",
+            result[
+                result[f"{prefix}_TurnDown"]
+                ==
+                True
+            ]
+        )
+
+        stats(
+            f"{prefix} TURN UP",
+            result[
+                result[f"{prefix}_TurnUp"]
+                ==
+                True
+            ]
+        )
+
+    # ========================================================
+    # PERSISTENZA
+    # ========================================================
+
+    print()
+    print("=" * 125)
+    print("PERSISTENZA DEL DETERIORAMENTO")
+    print("=" * 125)
+
+    for prefix in ["MACD", "HIST", "VO"]:
+
+        for n in [1, 2, 3, 4]:
+
+            stats(
+                f"{prefix} negative weeks >= {n}",
+                result[
+                    result[
+                        f"{prefix}_NegativePersistence4"
+                    ]
+                    >=
+                    n
+                ]
+            )
+
+    # ========================================================
+    # DIVERGENZE
+    # ========================================================
+
+    print()
+    print("=" * 125)
+    print("DIVERGENZE / DETERIORAMENTO ANTICIPATO")
+    print("=" * 125)
+
+    tests = {
+        "PRICE UP 4W + MACD DOWN":
+            result["PriceUp_MACDDown4"],
+
+        "PRICE UP 4W + HIST DOWN":
+            result["PriceUp_HISTDown4"],
+
+        "PRICE UP 4W + VO DOWN":
+            result["PriceUp_VODown4"],
+
+        "MACD + HIST deteriorating":
+            result["MACD_HIST_Deteriorating"],
+
+        "MACD + VO deteriorating":
+            result["MACD_VO_Deteriorating"],
+
+        "MACD rolling over":
+            result["MACD_RollingOver"],
+
+        "HIST rolling over":
+            result["HIST_RollingOver"],
+
+        "VO rolling over":
+            result["VO_RollingOver"],
+
+        "MACD + HIST rolling over":
+            (
+                result["MACD_RollingOver"]
+                &
+                result["HIST_RollingOver"]
+            ),
+
+        "MACD + VO rolling over":
+            (
+                result["MACD_RollingOver"]
+                &
+                result["VO_RollingOver"]
+            ),
+    }
+
+    for name, condition in tests.items():
+        stats(name, result[condition])
+
+    # ========================================================
+    # EARLY SELL
+    # ========================================================
+
+    early = result[
+        result["Return1"] > -0.04
+    ].copy()
+
+    print()
+    print("=" * 125)
+    print("EARLY SELL - RETURN1 > -4%")
+    print("=" * 125)
+
+    stats("EARLY BASE", early)
+
+    phase_analysis(early, "MACD")
+    phase_analysis(early, "HIST")
+    phase_analysis(early, "VO")
+
+    print()
+    print("--- EARLY DYNAMIC CONDITIONS ---")
+
+    early_tests = {
+        "EARLY MACD rolling over":
+            early["MACD_RollingOver"],
+
+        "EARLY HIST rolling over":
+            early["HIST_RollingOver"],
+
+        "EARLY VO rolling over":
+            early["VO_RollingOver"],
+
+        "EARLY MACD+HIST deteriorating":
+            early["MACD_HIST_Deteriorating"],
+
+        "EARLY MACD+VO deteriorating":
+            early["MACD_VO_Deteriorating"],
+
+        "EARLY PriceUp + MACDDown":
+            early["PriceUp_MACDDown4"],
+
+        "EARLY PriceUp + HISTDown":
+            early["PriceUp_HISTDown4"],
+
+        "EARLY PriceUp + VODown":
+            early["PriceUp_VODown4"],
+    }
+
+    for name, condition in early_tests.items():
+        stats(name, early[condition])
+
+    # ========================================================
+    # DETTAGLIO 6 EARLY SELL
+    # ========================================================
+
+    print()
+    print("=" * 125)
+    print("DETTAGLIO EARLY SELL")
+    print("=" * 125)
+
+    cols = [
+        "Sample",
+        "Ticker",
+        "Date",
+        "Matched",
+        "Return1",
+        "Return4",
+
+        "MACD_Phase",
+        "MACD_Change4",
+        "MACD_Change8",
+        "MACD_RangePos8",
+        "MACD_NegativePersistence4",
+
+        "HIST_Phase",
+        "HIST_Change4",
+        "HIST_RangePos8",
+        "HIST_NegativePersistence4",
+
+        "VO_Phase",
+        "VO_Change4",
+        "VO_RangePos8",
+        "VO_NegativePersistence4",
+
+        "PriceUp_MACDDown4",
+        "PriceUp_HISTDown4",
+        "PriceUp_VODown4",
+    ]
+
+    print(
+        early[cols]
+        .sort_values(
+            ["Matched", "Ticker", "Date"]
+        )
+        .to_string(index=False)
+    )
+
+    # ========================================================
+    # FALSI
+    # ========================================================
+
+    print()
+    print("=" * 125)
+    print("DETTAGLIO FALSI SELL")
+    print("=" * 125)
+
+    false = result[
+        ~result["Matched"]
+    ]
+
+    print(
+        false[cols]
+        .sort_values(
+            ["Ticker", "Date"]
+        )
+        .to_string(index=False)
+    )
+
+    result.to_csv(
+        OUTPUT_FILE,
+        index=False
+    )
+
+    print()
+    print("=" * 125)
+    print("FILE CREATO")
+    print("=" * 125)
+    print(OUTPUT_FILE)
+    print()
+    print("V6C COMPLETATA.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,30 @@
+{
+  "files.watcherExclude": {
+    "**/data/**": true,
+    "**/.venv/**": true,
+    "**/__pycache__/**": true,
+    "**/.git/**": true
+  },
+
+  "search.exclude": {
+    "**/data/**": true,
+    "**/.venv/**": true,
+    "**/__pycache__/**": true,
+    "**/.git/**": true
+  },
+
+  "files.exclude": {
+    "**/data": true,
+    "**/.venv": true,
+    "**/__pycache__": true,
+    "**/*.pyc": true
+  },
+
+  "python.analysis.indexing": false,
+  "python.analysis.diagnosticMode": "openFilesOnly",
+
+  "git.autofetch": false,
+  "git.autorefresh": false,
+
+  "editor.minimap.enabled": false
+}
