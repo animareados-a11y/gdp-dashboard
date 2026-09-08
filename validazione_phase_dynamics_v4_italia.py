@@ -1,413 +1,794 @@
 """
 MarketSentinel
-V40.5 PHASE DYNAMICS SHADOW V4
+VALIDAZIONE PHASE DYNAMICS V4 - ITALIA
 
 OBIETTIVO
 ---------
-Correggere esclusivamente i BUY / SELL presenti nei primi 3 AGE
-di run SAR che V40.10 considera NON qualificati.
+Validare la V4 sui ticker italiani prima di qualunque FULL200.
+
+Controlli:
+1. quanti BUY / SELL non qualificati vengono rielaborati;
+2. quanti BUY / SELL finali restano fuori da run qualificati AGE 1-3;
+3. distribuzione PHASE V3.1 vs V4;
+4. transizioni V3.1 -> V4;
+5. esito dei casi rielaborati;
+6. ultima settimana per ticker;
+7. focus Fineco / UCG / ENEL.
 
 IMPORTANTE
 ----------
 - NON modifica production
-- NON modifica V3.1
 - NON modifica V40.10
+- NON modifica Dynamics V3.1
 - NON modifica engine.py
-- nessuna nuova soglia tecnica
 """
 
 from __future__ import annotations
 
-import numpy as np
+from pathlib import Path
+
 import pandas as pd
 
-import weekly_v40_5_phase_dynamics_shadow as v31
-import weekly_v40_10_sar_phase_fix as v4010
+import weekly_v40_5_phase_dynamics_shadow_v4 as v4
 
 
-VERSION = "V4"
+INPUT_FILE = Path("data/v40_35_full200_weekly.csv")
+
+OUT_CHANGED = Path(
+    "data/validazione_phase_dynamics_v4_italia_changed.csv"
+)
+
+OUT_REPROCESSED = Path(
+    "data/validazione_phase_dynamics_v4_italia_reprocessed.csv"
+)
+
+OUT_LATEST = Path(
+    "data/validazione_phase_dynamics_v4_italia_latest.csv"
+)
+
+OUT_SUMMARY = Path(
+    "data/validazione_phase_dynamics_v4_italia_summary.csv"
+)
 
 
-def _run_v4010_components(df: pd.DataFrame) -> pd.DataFrame:
-    g = df.copy()
-
-    g = v4010.add_previous_sar_run_information(g)
-    g = v4010.qualify_sar_flips(g)
-    g = v4010.propagate_qualified_signal(g)
-
-    return g
+FOCUS_TICKERS = [
+    "FBK.MI",
+    "UCG.MI",
+    "ENEL.MI",
+]
 
 
-def _invalid_buy_sell_mask(g: pd.DataFrame) -> pd.Series:
+def banner(title: str):
+    print()
+    print("=" * 140)
+    print(title)
+    print("=" * 140)
 
-    age = pd.to_numeric(
-        g["SAR_AGE"],
-        errors="coerce",
+
+def main():
+
+    banner(
+        "VALIDAZIONE PHASE DYNAMICS V4 - ITALIA"
     )
 
-    side = pd.to_numeric(
-        g["SAR_SIDE"],
-        errors="coerce",
-    )
-
-    qualified = pd.to_numeric(
-        g["V4010_RUN_QUALIFIED"],
-        errors="coerce",
-    ).fillna(0)
-
-    phase = g["PHASE_DYNAMICS_SHADOW"]
-
-    invalid_buy = (
-        phase.eq("BUY")
-        & side.eq(1)
-        & age.isin([1, 2, 3])
-        & qualified.eq(0)
-    )
-
-    invalid_sell = (
-        phase.eq("SELL")
-        & side.eq(-1)
-        & age.isin([1, 2, 3])
-        & qualified.eq(0)
-    )
-
-    return invalid_buy | invalid_sell
-
-
-def _classify_from_neutralized_base(
-    first: pd.DataFrame,
-    invalid: pd.Series,
-) -> pd.DataFrame:
-    """
-    Riesegue SOLO la logica dinamica V3.1 usando come base
-    la PHASE_DYNAMICS_BASE già calcolata nel primo passaggio.
-
-    I BUY/SELL non qualificati vengono neutralizzati
-    a INDECISIONE.
-
-    NOTA:
-    non richiamiamo v31.process_ticker(), perché quello
-    ricostruirebbe nuovamente la base a monte.
-    """
-
-    g = first.copy().reset_index(drop=True)
-
-    g["V4_BASE_ORIGINAL"] = (
-        g["PHASE_DYNAMICS_BASE"].copy()
-    )
-
-    g["V4_INVALID_BUY_SELL"] = (
-        invalid.astype(int).to_numpy()
-    )
-
-    g["PHASE_DYNAMICS_BASE"] = (
-        g["PHASE_DYNAMICS_BASE"].copy()
-    )
-
-    g.loc[
-        invalid.to_numpy(),
-        "PHASE_DYNAMICS_BASE",
-    ] = "INDECISIONE"
-
-    # ---------------------------------------------------------
-    # La V3.1 espone già tutte le feature tecniche necessarie.
-    # Dobbiamo quindi richiamare la funzione che produce
-    # la PHASE dinamica partendo dalla PHASE_DYNAMICS_BASE.
-    #
-    # Cerchiamo esplicitamente la funzione disponibile,
-    # senza inventare nomi di output o nuove regole.
-    # ---------------------------------------------------------
-
-    candidate_functions = [
-        "apply_phase_dynamics",
-        "apply_dynamics",
-        "apply_phase_dynamics_shadow",
-        "apply_dynamics_shadow",
-    ]
-
-    applied = False
-
-    for function_name in candidate_functions:
-
-        if hasattr(v31, function_name):
-
-            func = getattr(
-                v31,
-                function_name,
-            )
-
-            g = func(g)
-
-            applied = True
-            break
-
-    if not applied:
-        raise RuntimeError(
-            "Non trovo nella V3.1 la funzione che applica "
-            "la logica Dynamics alla PHASE_DYNAMICS_BASE. "
-            "Serve leggere il nome reale della funzione "
-            "prima di procedere."
+    if not INPUT_FILE.exists():
+        raise FileNotFoundError(
+            f"Input non trovato: {INPUT_FILE}"
         )
 
-    return g
+    df = pd.read_csv(
+        INPUT_FILE,
+        low_memory=False,
+    )
 
+    if "Ticker" not in df.columns:
+        raise RuntimeError(
+            "Colonna Ticker non trovata."
+        )
 
-def process_ticker(df: pd.DataFrame) -> pd.DataFrame:
+    if "Date" not in df.columns:
+        raise RuntimeError(
+            "Colonna Date non trovata."
+        )
 
-    if df.empty:
-        return df.copy()
+    df["Date"] = pd.to_datetime(
+        df["Date"],
+        utc=True,
+        errors="coerce",
+    )
 
-    # =========================================================
-    # 1. V3.1 NORMALE
-    # =========================================================
+    italy_tickers = sorted(
+        [
+            ticker
+            for ticker in df["Ticker"]
+            .dropna()
+            .unique()
+            if str(ticker).endswith(".MI")
+        ]
+    )
 
-    first = v31.process_ticker(
-        df.copy()
-    ).reset_index(drop=True)
+    print()
+    print(
+        f"Ticker italiani trovati: "
+        f"{len(italy_tickers)}"
+    )
+
+    all_rows = []
+
+    for i, ticker in enumerate(
+        italy_tickers,
+        start=1,
+    ):
+
+        print(
+            f"[{i:02d}/{len(italy_tickers):02d}] "
+            f"{ticker}"
+        )
+
+        g = (
+            df[
+                df["Ticker"] == ticker
+            ]
+            .copy()
+            .sort_values("Date")
+            .reset_index(drop=True)
+        )
+
+        if g.empty:
+            continue
+
+        try:
+            z = v4.process_ticker(
+                g
+            )
+
+        except Exception as exc:
+            print(
+                f"  ERRORE: {exc}"
+            )
+            continue
+
+        z["Ticker"] = ticker
+
+        all_rows.append(z)
+
+    if not all_rows:
+        raise RuntimeError(
+            "Nessun ticker processato."
+        )
+
+    out = pd.concat(
+        all_rows,
+        ignore_index=True,
+    )
 
     required = [
-        "PHASE_DYNAMICS_BASE",
-        "PHASE_DYNAMICS_SHADOW",
+        "Ticker",
+        "Date",
         "SAR_SIDE",
         "SAR_AGE",
+        "V4010_RUN_QUALIFIED",
+        "PHASE_DYNAMICS_V31",
+        "PHASE_DYNAMICS_V4_PRE_V4010",
+        "PHASE_DYNAMICS_V4",
+        "V4_INVALID_BUY_SELL",
+        "V4_INVALID_FINAL_BUY",
+        "V4_INVALID_FINAL_SELL",
+        "PHASE_DYNAMICS_V4_REASON",
     ]
 
     missing = [
         c
         for c in required
-        if c not in first.columns
+        if c not in out.columns
     ]
 
     if missing:
         raise RuntimeError(
-            "Colonne mancanti dopo V3.1: "
+            "Colonne mancanti: "
             + ", ".join(missing)
         )
 
-    phase_v31 = (
-        first["PHASE_DYNAMICS_SHADOW"]
-        .copy()
+    # ============================================================
+    # RISULTATO GENERALE
+    # ============================================================
+
+    banner(
+        "RISULTATO GENERALE"
     )
 
-    # =========================================================
-    # 2. QUALIFICAZIONE V40.10
-    # =========================================================
+    total_rows = len(out)
 
-    q = first.copy()
-
-    q["PHASE"] = (
-        q["PHASE_DYNAMICS_SHADOW"]
-        .copy()
+    changed_mask = (
+        out["PHASE_DYNAMICS_V31"]
+        !=
+        out["PHASE_DYNAMICS_V4"]
     )
 
-    q = _run_v4010_components(q)
-
-    invalid = _invalid_buy_sell_mask(q)
-
-    # =========================================================
-    # 3. SE NON CI SONO CASI INVALIDI
-    # =========================================================
-
-    if int(invalid.sum()) == 0:
-
-        final = q.copy()
-
-        final["PHASE"] = (
-            final["PHASE_DYNAMICS_SHADOW"]
-            .copy()
-        )
-
-        final = v4010.apply_v4010_fix(
-            final
-        )
-
-        final["PHASE_DYNAMICS_V31"] = (
-            phase_v31.to_numpy()
-        )
-
-        final[
-            "PHASE_DYNAMICS_V4_PRE_V4010"
-        ] = final[
-            "PHASE_DYNAMICS_SHADOW"
-        ].copy()
-
-        final["PHASE_DYNAMICS_V4"] = (
-            final["PHASE"].copy()
-        )
-
-        final["V4_INVALID_BUY_SELL"] = 0
-
-        final[
-            "V4_FIRST_PASS_RUN_QUALIFIED"
-        ] = pd.to_numeric(
-            final["V4010_RUN_QUALIFIED"],
+    reprocessed_mask = (
+        pd.to_numeric(
+            out["V4_INVALID_BUY_SELL"],
             errors="coerce",
-        ).fillna(0).astype(int)
-
-        final[
-            "PHASE_DYNAMICS_V4_REASON"
-        ] = "UNCHANGED_V31"
-
-    else:
-
-        # =====================================================
-        # 4. NEUTRALIZZAZIONE DEI SOLI BUY/SELL NON QUALIFICATI
-        # =====================================================
-
-        second = _classify_from_neutralized_base(
-            q,
-            invalid,
         )
+        .fillna(0)
+        .eq(1)
+    )
 
-        if "PHASE_DYNAMICS_SHADOW" not in second.columns:
-            raise RuntimeError(
-                "La riclassificazione V3.1 non ha prodotto "
-                "PHASE_DYNAMICS_SHADOW."
-            )
-
-        second[
-            "PHASE_DYNAMICS_V4_PRE_V4010"
-        ] = second[
-            "PHASE_DYNAMICS_SHADOW"
-        ].copy()
-
-        # =====================================================
-        # 5. V40.10 FINALE
-        # =====================================================
-
-        second["PHASE"] = second[
-            "PHASE_DYNAMICS_V4_PRE_V4010"
-        ].copy()
-
-        # Ricalcoliamo V40.10 sulla nuova PHASE
-        for col in [
-            "V4010_CORRECTION_REASON",
-            "V4010_PHASE_CORRECTED",
-            "V4010_PREVIOUS_STRUCTURE_CONFIRMED",
-            "V4010_PREV_PHASE",
-            "V4010_PREV_SAR_AGE",
-            "V4010_PREV_SAR_SIDE",
-            "V4010_QUALIFIED_FLIP",
-            "V4010_RUN_QUALIFIED",
-            "V4010_SAR_FLIP",
-            "V4010_SAR_RUN_ID",
-        ]:
-            if col in second.columns:
-                second = second.drop(
-                    columns=[col]
-                )
-
-        second = _run_v4010_components(
-            second
-        )
-
-        second = v4010.apply_v4010_fix(
-            second
-        )
-
-        final = second
-
-        final["PHASE_DYNAMICS_V31"] = (
-            phase_v31.to_numpy()
-        )
-
-        final["PHASE_DYNAMICS_V4"] = (
-            final["PHASE"].copy()
-        )
-
-        final["V4_INVALID_BUY_SELL"] = (
-            invalid.astype(int).to_numpy()
-        )
-
-        final[
-            "V4_FIRST_PASS_RUN_QUALIFIED"
-        ] = pd.to_numeric(
-            q["V4010_RUN_QUALIFIED"],
+    invalid_final_buy = int(
+        pd.to_numeric(
+            out[
+                "V4_INVALID_FINAL_BUY"
+            ],
             errors="coerce",
-        ).fillna(0).astype(int).to_numpy()
-
-        reasons = np.full(
-            len(final),
-            "UNCHANGED_V31",
-            dtype=object,
         )
+        .fillna(0)
+        .sum()
+    )
 
-        invalid_np = invalid.to_numpy()
+    invalid_final_sell = int(
+        pd.to_numeric(
+            out[
+                "V4_INVALID_FINAL_SELL"
+            ],
+            errors="coerce",
+        )
+        .fillna(0)
+        .sum()
+    )
 
-        for i in range(len(final)):
+    changed_rows = int(
+        changed_mask.sum()
+    )
 
-            if not invalid_np[i]:
-                continue
+    reprocessed_rows = int(
+        reprocessed_mask.sum()
+    )
 
-            old_phase = str(
-                phase_v31.iloc[i]
-            )
+    print()
+    print(
+        f"Righe totali: "
+        f"{total_rows:,}"
+    )
 
-            new_phase = str(
-                final[
-                    "PHASE_DYNAMICS_V4_PRE_V4010"
-                ].iloc[i]
-            )
+    print(
+        f"BUY/SELL non qualificati rielaborati: "
+        f"{reprocessed_rows}"
+    )
 
-            if old_phase == "BUY":
-                reasons[i] = (
-                    "UNQUALIFIED_BUY_RECLASSIFIED_TO_"
-                    + new_phase
-                )
+    print(
+        f"Righe cambiate V3.1 -> V4: "
+        f"{changed_rows} "
+        f"({changed_rows / total_rows * 100:.2f}%)"
+    )
 
-            else:
-                reasons[i] = (
-                    "UNQUALIFIED_SELL_RECLASSIFIED_TO_"
-                    + new_phase
-                )
+    print()
+    print(
+        f"BUY finali non validi: "
+        f"{invalid_final_buy}"
+    )
 
-        final[
-            "PHASE_DYNAMICS_V4_REASON"
-        ] = reasons
+    print(
+        f"SELL finali non validi: "
+        f"{invalid_final_sell}"
+    )
 
-    # =========================================================
-    # 6. SAFETY FINALE
-    # =========================================================
+    # ============================================================
+    # SAFETY BUY / SELL
+    # ============================================================
 
-    side = pd.to_numeric(
-        final["SAR_SIDE"],
+    banner(
+        "SAFETY BUY / SELL"
+    )
+
+    sar_side = pd.to_numeric(
+        out["SAR_SIDE"],
         errors="coerce",
     )
 
-    age = pd.to_numeric(
-        final["SAR_AGE"],
+    sar_age = pd.to_numeric(
+        out["SAR_AGE"],
         errors="coerce",
     )
 
     qualified = pd.to_numeric(
-        final["V4010_RUN_QUALIFIED"],
+        out["V4010_RUN_QUALIFIED"],
         errors="coerce",
     ).fillna(0)
 
     valid_buy = (
         qualified.eq(1)
-        & side.eq(1)
-        & age.isin([1, 2, 3])
+        &
+        sar_side.eq(1)
+        &
+        sar_age.isin([1, 2, 3])
     )
 
     valid_sell = (
         qualified.eq(1)
-        & side.eq(-1)
-        & age.isin([1, 2, 3])
+        &
+        sar_side.eq(-1)
+        &
+        sar_age.isin([1, 2, 3])
     )
 
-    final["V4_INVALID_FINAL_BUY"] = (
-        final[
+    final_buy = (
+        out[
             "PHASE_DYNAMICS_V4"
         ].eq("BUY")
-        & ~valid_buy
-    ).astype(int)
+    )
 
-    final["V4_INVALID_FINAL_SELL"] = (
-        final[
+    final_sell = (
+        out[
             "PHASE_DYNAMICS_V4"
         ].eq("SELL")
-        & ~valid_sell
-    ).astype(int)
+    )
 
-    return final
+    print()
+    print(
+        f"BUY finali totali: "
+        f"{int(final_buy.sum())}"
+    )
+
+    print(
+        f"BUY finali validi: "
+        f"{int((final_buy & valid_buy).sum())}"
+    )
+
+    print(
+        f"BUY finali non validi: "
+        f"{int((final_buy & ~valid_buy).sum())}"
+    )
+
+    print()
+    print(
+        f"SELL finali totali: "
+        f"{int(final_sell.sum())}"
+    )
+
+    print(
+        f"SELL finali validi: "
+        f"{int((final_sell & valid_sell).sum())}"
+    )
+
+    print(
+        f"SELL finali non validi: "
+        f"{int((final_sell & ~valid_sell).sum())}"
+    )
+
+    # ============================================================
+    # DISTRIBUZIONE
+    # ============================================================
+
+    banner(
+        "DISTRIBUZIONE PHASE V3.1 VS V4"
+    )
+
+    distribution = pd.concat(
+        [
+            out[
+                "PHASE_DYNAMICS_V31"
+            ]
+            .value_counts()
+            .rename("V31"),
+
+            out[
+                "PHASE_DYNAMICS_V4"
+            ]
+            .value_counts()
+            .rename("V4"),
+        ],
+        axis=1,
+    ).fillna(0).astype(int)
+
+    print()
+    print(
+        distribution.to_string()
+    )
+
+    # ============================================================
+    # TRANSIZIONI
+    # ============================================================
+
+    banner(
+        "TRANSIZIONI V3.1 -> V4"
+    )
+
+    transitions = (
+        out.loc[
+            changed_mask,
+            [
+                "PHASE_DYNAMICS_V31",
+                "PHASE_DYNAMICS_V4",
+            ],
+        ]
+        .value_counts()
+        .reset_index(
+            name="COUNT"
+        )
+        .sort_values(
+            "COUNT",
+            ascending=False,
+        )
+    )
+
+    if transitions.empty:
+        print()
+        print(
+            "Nessuna modifica."
+        )
+    else:
+        print()
+        print(
+            transitions.to_string(
+                index=False
+            )
+        )
+
+    # ============================================================
+    # ESITO DEI BUY / SELL NON QUALIFICATI
+    # ============================================================
+
+    banner(
+        "ESITO BUY / SELL NON QUALIFICATI RIELABORATI"
+    )
+
+    reclassified = (
+        out.loc[
+            reprocessed_mask,
+            [
+                "PHASE_DYNAMICS_V31",
+                "PHASE_DYNAMICS_V4_PRE_V4010",
+                "PHASE_DYNAMICS_V4",
+            ],
+        ]
+        .value_counts()
+        .reset_index(
+            name="COUNT"
+        )
+        .sort_values(
+            "COUNT",
+            ascending=False,
+        )
+    )
+
+    print()
+    print(
+        reclassified.to_string(
+            index=False
+        )
+    )
+
+    # ============================================================
+    # MOTIVI
+    # ============================================================
+
+    banner(
+        "MOTIVI V4"
+    )
+
+    reasons = (
+        out.loc[
+            reprocessed_mask,
+            "PHASE_DYNAMICS_V4_REASON",
+        ]
+        .value_counts()
+        .reset_index()
+    )
+
+    reasons.columns = [
+        "REASON",
+        "COUNT",
+    ]
+
+    print()
+    print(
+        reasons.to_string(
+            index=False
+        )
+    )
+
+    # ============================================================
+    # PRIMI 80 CASI RIELABORATI
+    # ============================================================
+
+    banner(
+        "PRIMI 80 BUY / SELL NON QUALIFICATI RIELABORATI"
+    )
+
+    detail_cols = [
+        "Ticker",
+        "Date",
+        "SAR_SIDE",
+        "SAR_AGE",
+        "V4010_RUN_QUALIFIED",
+        "PHASE_DYNAMICS_V31",
+        "PHASE_DYNAMICS_V4_PRE_V4010",
+        "PHASE_DYNAMICS_V4",
+        "PHASE_DYNAMICS_V4_REASON",
+    ]
+
+    optional_cols = [
+        "PHASE_DYNAMICS_REASON",
+        "LATERAL_SIGNAL",
+        "WEAK_UP_TRIGGER",
+        "WEAK_DOWN_TRIGGER",
+        "BULL_RECOVERY_RAW",
+        "BEAR_RECOVERY_RAW",
+        "BULL_RECOVERY_CONFIRMED",
+        "BEAR_RECOVERY_CONFIRMED",
+    ]
+
+    for c in optional_cols:
+        if c in out.columns:
+            detail_cols.append(c)
+
+    print()
+    print(
+        out.loc[
+            reprocessed_mask,
+            detail_cols,
+        ]
+        .head(80)
+        .to_string(
+            index=False
+        )
+    )
+
+    # ============================================================
+    # ULTIMA SETTIMANA
+    # ============================================================
+
+    banner(
+        "ULTIMA SETTIMANA PER TICKER"
+    )
+
+    latest = (
+        out.sort_values(
+            [
+                "Ticker",
+                "Date",
+            ]
+        )
+        .groupby(
+            "Ticker",
+            as_index=False,
+        )
+        .tail(1)
+        .copy()
+    )
+
+    latest_cols = [
+        "Ticker",
+        "Date",
+        "SAR_SIDE",
+        "SAR_AGE",
+        "V4010_RUN_QUALIFIED",
+        "PHASE_DYNAMICS_V31",
+        "PHASE_DYNAMICS_V4",
+        "PHASE_DYNAMICS_V4_REASON",
+    ]
+
+    print()
+    print(
+        latest[
+            latest_cols
+        ]
+        .sort_values(
+            "Ticker"
+        )
+        .to_string(
+            index=False
+        )
+    )
+
+    # ============================================================
+    # FOCUS
+    # ============================================================
+
+    for ticker in FOCUS_TICKERS:
+
+        banner(
+            ticker
+        )
+
+        z = (
+            out[
+                out["Ticker"] == ticker
+            ]
+            .copy()
+            .sort_values("Date")
+        )
+
+        if z.empty:
+            print(
+                "Ticker non trovato."
+            )
+            continue
+
+        if ticker == "FBK.MI":
+            z = z[
+                z["Date"]
+                >=
+                pd.Timestamp(
+                    "2026-05-01",
+                    tz="UTC",
+                )
+            ]
+
+        elif ticker == "UCG.MI":
+            z = z[
+                (
+                    z["Date"]
+                    >=
+                    pd.Timestamp(
+                        "2023-11-01",
+                        tz="UTC",
+                    )
+                )
+                &
+                (
+                    z["Date"]
+                    <=
+                    pd.Timestamp(
+                        "2024-08-31",
+                        tz="UTC",
+                    )
+                )
+            ]
+
+        elif ticker == "ENEL.MI":
+            z = z[
+                z["Date"]
+                >=
+                pd.Timestamp(
+                    "2026-03-01",
+                    tz="UTC",
+                )
+            ]
+
+        focus_cols = [
+            "Date",
+            "Close",
+            "SAR_SIDE",
+            "SAR_AGE",
+            "V4010_RUN_QUALIFIED",
+            "PHASE_DYNAMICS_V31",
+            "PHASE_DYNAMICS_V4_PRE_V4010",
+            "PHASE_DYNAMICS_V4",
+            "PHASE_DYNAMICS_V4_REASON",
+        ]
+
+        focus_cols = [
+            c
+            for c in focus_cols
+            if c in z.columns
+        ]
+
+        print()
+        print(
+            z[
+                focus_cols
+            ]
+            .to_string(
+                index=False
+            )
+        )
+
+    # ============================================================
+    # SALVATAGGI
+    # ============================================================
+
+    banner(
+        "SALVATAGGIO"
+    )
+
+    changed_df = (
+        out.loc[
+            changed_mask
+        ]
+        .copy()
+    )
+
+    reprocessed_df = (
+        out.loc[
+            reprocessed_mask
+        ]
+        .copy()
+    )
+
+    summary = pd.DataFrame(
+        [
+            {
+                "ROWS": total_rows,
+                "TICKERS": out[
+                    "Ticker"
+                ].nunique(),
+                "REPROCESSED_INVALID_BUY_SELL":
+                    reprocessed_rows,
+                "CHANGED_V31_TO_V4":
+                    changed_rows,
+                "CHANGED_PCT":
+                    (
+                        changed_rows
+                        /
+                        total_rows
+                        *
+                        100
+                    ),
+                "INVALID_FINAL_BUY":
+                    invalid_final_buy,
+                "INVALID_FINAL_SELL":
+                    invalid_final_sell,
+            }
+        ]
+    )
+
+    changed_df.to_csv(
+        OUT_CHANGED,
+        index=False,
+    )
+
+    reprocessed_df.to_csv(
+        OUT_REPROCESSED,
+        index=False,
+    )
+
+    latest.to_csv(
+        OUT_LATEST,
+        index=False,
+    )
+
+    summary.to_csv(
+        OUT_SUMMARY,
+        index=False,
+    )
+
+    print()
+    print(
+        f"Salvato: "
+        f"{OUT_CHANGED}"
+    )
+
+    print(
+        f"Salvato: "
+        f"{OUT_REPROCESSED}"
+    )
+
+    print(
+        f"Salvato: "
+        f"{OUT_LATEST}"
+    )
+
+    print(
+        f"Salvato: "
+        f"{OUT_SUMMARY}"
+    )
+
+    banner(
+        "FINE VALIDAZIONE"
+    )
+
+    if (
+        invalid_final_buy == 0
+        and
+        invalid_final_sell == 0
+    ):
+        print()
+        print(
+            "SAFETY BUY/SELL: OK"
+        )
+    else:
+        print()
+        print(
+            "ATTENZIONE: restano BUY/SELL "
+            "fuori dalla tassonomia."
+        )
+
+    print()
+    print(
+        "Nessun file production modificato."
+    )
+
+
+if __name__ == "__main__":
+    main()
