@@ -1,0 +1,7 @@
+TARGET,METHOD,POLICY,OOS_N,OOS_EVENT_RATE,CALIBRATION_SAMPLE,METHOD_SELECTION_SOURCE,V40_37B_EXPLORATORY_METHOD,EXPLORATORY_METHOD_USED_FOR_PRODUCTION,CALIBRATOR_FILE
+BEAR_TO_BULL_1W,PLATT,PREDECLARED_V40_25,29247,0.0942318870311485,V40.40a corrected-purging OOS predictions,Historical frozen V40.25 policy,ISOTONIC,False,data/v40_40b_weekly_production/BEAR_TO_BULL_1W_platt_calibrator.pkl
+BEAR_TO_BULL_2W,ISOTONIC,PREDECLARED_V40_25,29167,0.1916549525148284,V40.40a corrected-purging OOS predictions,Historical frozen V40.25 policy,PLATT,False,data/v40_40b_weekly_production/BEAR_TO_BULL_2W_isotonic_calibrator.pkl
+BEAR_TO_BULL_3W,PLATT,PREDECLARED_V40_25,29090,0.2801306290821588,V40.40a corrected-purging OOS predictions,Historical frozen V40.25 policy,PLATT,False,data/v40_40b_weekly_production/BEAR_TO_BULL_3W_platt_calibrator.pkl
+BULL_TO_BEAR_1W,ISOTONIC,PREDECLARED_V40_25,36644,0.0791671214932867,V40.40a corrected-purging OOS predictions,Historical frozen V40.25 policy,ISOTONIC,False,data/v40_40b_weekly_production/BULL_TO_BEAR_1W_isotonic_calibrator.pkl
+BULL_TO_BEAR_2W,PLATT,PREDECLARED_V40_25,36532,0.1582448264535202,V40.40a corrected-purging OOS predictions,Historical frozen V40.25 policy,ISOTONIC,False,data/v40_40b_weekly_production/BULL_TO_BEAR_2W_platt_calibrator.pkl
+BULL_TO_BEAR_3W,PLATT,PREDECLARED_V40_25,36415,0.2275161334614856,V40.40a corrected-purging OOS predictions,Historical frozen V40.25 policy,ISOTONIC,False,data/v40_40b_weekly_production/BULL_TO_BEAR_3W_platt_calibrator.pkl
