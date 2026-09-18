@@ -1,0 +1,69 @@
+{
+  "version": "V40.48",
+  "purpose": "Opportunity Bridge OOS benchmark",
+  "feature_source": "data/v40_36b_full200_features.csv",
+  "feature_list_source": "data/v40_36b_feature_list.csv",
+  "common_oos_source": "data/v40_46_opportunity_target_study/v40_46_common_oos_targets.csv",
+  "technical_features": 413,
+  "feature_sets": [
+    "TECH_PHASE",
+    "TECH_PHASE_STRENGTH",
+    "TECH_PHASE_REVERSAL",
+    "ALL"
+  ],
+  "target_metric": "SPEED_PCT_PER_WEEK",
+  "target_variants": [
+    "CONDITIONAL",
+    "COMPLETE"
+  ],
+  "sides": [
+    "BUY",
+    "SELL"
+  ],
+  "horizons_weeks": [
+    5,
+    8
+  ],
+  "rf_params": {
+    "n_estimators": 500,
+    "max_features": "sqrt",
+    "min_samples_leaf": 4,
+    "n_jobs": 1,
+    "random_state": 42
+  },
+  "test_blocks": [
+    {
+      "FOLD": 1,
+      "TEST_START": "2023-04-07",
+      "TEST_END": "2023-12-29"
+    },
+    {
+      "FOLD": 2,
+      "TEST_START": "2024-01-05",
+      "TEST_END": "2024-12-27"
+    },
+    {
+      "FOLD": 3,
+      "TEST_START": "2025-01-03",
+      "TEST_END": "2025-12-26"
+    },
+    {
+      "FOLD": 4,
+      "TEST_START": "2026-01-02",
+      "TEST_END": "2026-07-03"
+    }
+  ],
+  "purge_rule": "train_end_position = test_start_position - horizon - 1",
+  "train_only_imputation": true,
+  "checkpoint_resume": true,
+  "phase_v40_39_modified": false,
+  "reversal_v40_40_modified": false,
+  "strength_v40_44_modified": false,
+  "opportunity_score_1_10": false,
+  "manual_weights": false,
+  "common_ticker_dates": 41390,
+  "common_tickers": 198,
+  "jobs_expected": 128,
+  "jobs_completed": 128,
+  "structural_pass": true
+}
