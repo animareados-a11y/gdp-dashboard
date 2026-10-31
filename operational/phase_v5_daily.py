@@ -396,6 +396,15 @@ def apply_buy_long_bear_confirmation(
 
             if confirmation_position is None:
 
+                # Un BUY1 non può iniziare dopo che il ciclo
+                # è già entrato in TREND_RIALZISTA.
+                if str(g.at[j, pre_v4010_col]) == "TREND_RIALZISTA":
+                    confirm_count = 0
+                    g.at[j, "PHASE_DYNAMICS_V5"] = "TREND_RIALZISTA"
+                    g.at[j, "V5_BUY_STAGE"] = "TREND_ALREADY_ACTIVE"
+                    g.at[j, "V5_BUY_REASON"] = "BUY_LATE_CONFIRMATION_BLOCKED"
+                    continue
+
                 # ---------------------------------------------
                 # RESET:
                 # una HA bearish decisiva invalida tutte
