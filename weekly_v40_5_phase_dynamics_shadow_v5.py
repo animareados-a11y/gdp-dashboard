@@ -348,6 +348,7 @@ def apply_buy_long_bear_confirmation(
         confirm_count = 0
         confirmation_position = None
         reset_count = 0
+        trend_already_active = False
 
         # ====================================================
         # CAUSAL SCAN DEL RUN BULLISH
@@ -399,8 +400,13 @@ def apply_buy_long_bear_confirmation(
                 # Un BUY1 non può iniziare dopo che il ciclo
                 # è già entrato in TREND_RIALZISTA.
                 if str(g.at[j, pre_v4010_col]) == "TREND_RIALZISTA":
+                    trend_already_active = True
+
+                if trend_already_active:
                     confirm_count = 0
-                    g.at[j, "PHASE_DYNAMICS_V5"] = "TREND_RIALZISTA"
+                    g.at[j, "PHASE_DYNAMICS_V5"] = _safe_test_phase(
+                        g.at[j, pre_v4010_col]
+                    )
                     g.at[j, "V5_BUY_STAGE"] = "TREND_ALREADY_ACTIVE"
                     g.at[j, "V5_BUY_REASON"] = "BUY_LATE_CONFIRMATION_BLOCKED"
                     continue
