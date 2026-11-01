@@ -38,11 +38,33 @@ class _InternalLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         module.__file__ = str(ROOT / key)
         code = _SOURCES[key]
         if key == "operational/run_marketsentinel.py":
+            # PR: integrazione nel runner scientifico incorporato.
+            # Il filtro interviene dopo PHASE_NUOVA, senza modificare SAR/HA.
+            from ms_pr_filter import apply_pr_filter
+
+            anchor = '    phase = history["PHASE_NUOVA"]'
+            if code.count(anchor) != 1:
+                raise RuntimeError("PR: punto PHASE_NUOVA non univoco")
+
+            code = code.replace(
+                anchor,
+                '    from ms_pr_filter import apply_pr_filter\n'
+                '    history = apply_pr_filter(history, timeframe="DAILY")\n'
+                '    phase = history["PHASE_PRE_PR"]'
+            )
+
             old_check = 'data["Ticker"].nunique() != 200'
             old_error = "Universo diverso da 200 titoli"
             assert old_check in code and old_error in code
             code = code.replace(old_check, 'data["Ticker"].nunique() != 199')
             code = code.replace(old_error, "Universo diverso da 199 titoli")
+
+            # Allinea le priorità BUY(PR) nel runner DAILY incorporato.
+            old_priority = '"BUY1": 0,\n        "BUY2": 1,\n        "BUY3": 2,'
+            new_priority = '"BUY1": 0,\n        "BUY1(PR)": 0,\n        "BUY2": 1,\n        "BUY2(PR)": 1,\n        "BUY3": 2,\n        "BUY3(PR)": 2,'
+            assert code.count(old_priority) == 1
+            code = code.replace(old_priority, new_priority)
+
         if key == 'operational/build_usa80_v160_ratings.py':
             # Only replace the source of threshold CSV, never the scoring formula.
             code = code.replace('t = pd.read_csv(path)', 't = pd.read_csv(__import__("io").StringIO(_INTERNAL_THRESHOLDS[phase]))')
@@ -286,11 +308,11 @@ def load_table():
     close=pd.to_numeric(d.get('Close'),errors='coerce')
     mean=pd.to_numeric(d.get('targetMeanPrice'),errors='coerce')
     d['RENDIMENTO ATTESO']=(mean/close-1)*100
-    d['RATING']=pd.to_numeric(d['RATING_V160'],errors='coerce').where(d['PHASE_NUOVA'].isin(['BUY1','BUY2','BUY3']))
+    d['RATING']=pd.to_numeric(d['RATING_V160'],errors='coerce').where(d['PHASE_NUOVA'].isin(['BUY1','BUY2','BUY3','BUY1(PR)','BUY2(PR)','BUY3(PR)']))
     d['DATA']=pd.to_datetime(d['Date'],errors='coerce',utc=True).dt.strftime('%d/%m/%Y')
     d=d.rename(columns={'Ticker':'NOME TITOLO','PHASE_NUOVA':'PHASE NUOVA'})
     d['MERCATO']=d['MERCATO'].replace({'USA80':'USA','USA40':'USA'})
-    d['_buy']=~d['PHASE NUOVA'].isin(['BUY1','BUY2','BUY3'])
+    d['_buy']=~d['PHASE NUOVA'].isin(['BUY1','BUY2','BUY3','BUY1(PR)','BUY2(PR)','BUY3(PR)'])
     d['_phase']=d['PHASE NUOVA'].map(ORDER).fillna(9)
     d=d.sort_values(['_buy','RATING','_phase','NOME TITOLO'],ascending=[True,False,True,True],na_position='last')
     return d[COLUMNS].reset_index(drop=True),pd.to_datetime(pd.read_csv(p,usecols=['Date'])['Date'],utc=True).max()

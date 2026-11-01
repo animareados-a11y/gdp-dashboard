@@ -485,7 +485,7 @@ def load_table():
     close=pd.to_numeric(d.get('Close'),errors='coerce')
     mean=pd.to_numeric(d.get('targetMeanPrice'),errors='coerce')
     d['RENDIMENTO ATTESO']=(mean/close-1)*100
-    d['RATING']=pd.to_numeric(d['RATING_V160'],errors='coerce').where(d['PHASE_NUOVA'].isin(['BUY1','BUY2','BUY3']))
+    d['RATING']=pd.to_numeric(d['RATING_V160'],errors='coerce').where(d['PHASE_NUOVA'].isin(['BUY1','BUY2','BUY3','BUY1(PR)','BUY2(PR)','BUY3(PR)']))
     # Data VISIBILE: giorno effettivo della pubblicazione WEEKLY.
     # Date scientifiche originali preservate nella colonna Date.
     from datetime import datetime
@@ -498,7 +498,7 @@ def load_table():
     d['DATA'] = display_date
     d=d.rename(columns={'Ticker':'NOME TITOLO','PHASE_NUOVA':'PHASE NUOVA'})
     d['MERCATO']=d['MERCATO'].replace({'USA80':'USA','USA40':'USA'})
-    d['_buy']=~d['PHASE NUOVA'].isin(['BUY1','BUY2','BUY3'])
+    d['_buy']=~d['PHASE NUOVA'].isin(['BUY1','BUY2','BUY3','BUY1(PR)','BUY2(PR)','BUY3(PR)'])
     d['_phase']=d['PHASE NUOVA'].map(ORDER).fillna(9)
     d=d.sort_values(['_buy','_phase','RATING','NOME TITOLO'],ascending=[True,True,False,True],na_position='last')
     return ms_attach_display_prices(d)[COLUMNS].reset_index(drop=True),pd.to_datetime(display_date,dayfirst=True)
@@ -585,7 +585,7 @@ def excel_bytes(frame):
                     phase = norm(cell.value)
                     if confluence:
                         cell.font = Font(color="242424", bold=True)
-                    elif phase in {"BUY1", "BUY2", "BUY3"}:
+                    elif phase in {"BUY1", "BUY2", "BUY3", "BUY1(PR)", "BUY2(PR)", "BUY3(PR)"}:
                         cell.fill = PatternFill("solid", fgColor="D9F5E9")
                         cell.font = Font(color="075C43", bold=True)
                     elif phase.startswith("SELL"):
@@ -670,8 +670,10 @@ def overlay_scientific_intraday(d):
         raise ValueError("Ticker intraday diversi da quelli del DAILY consolidato")
     live = live.set_index("Ticker")
     d = d.copy().set_index("Ticker")
-    for col in ("PHASE_NUOVA", "RATING_V160", "Close", "Date"):
-        d[col] = live[col].reindex(d.index)
+    # Le classificazioni scientifiche consolidate, incluso PR,
+    # non devono essere sovrascritte dai risultati intraday precedenti.
+    # L'intraday mantiene esclusivamente il prezzo provvisorio.
+    d["PREZZO INTRADAY"] = live["Close"].reindex(d.index)
     d = d.reset_index()
     return d
 
@@ -743,7 +745,7 @@ def load_daily_unified(use_intraday=False):
 
     d["RATING"] = pd.to_numeric(
         d["RATING_V160"], errors="coerce"
-    ).where(d["PHASE_NUOVA"].isin(["BUY1", "BUY2", "BUY3"]))
+    ).where(d["PHASE_NUOVA"].isin(["BUY1", "BUY2", "BUY3", "BUY1(PR)", "BUY2(PR)", "BUY3(PR)"]))
 
     d["DATA"] = pd.to_datetime(
         d["Date"], utc=True, format="mixed", errors="coerce"
@@ -781,7 +783,7 @@ def get_intraday_quotes(tickers):
 def load_daily_comparison():
     from ms_daily_comparison import compare_daily_weekly
     d = compare_daily_weekly(load_daily_unified(use_intraday=st.session_state.get("ms_scientific_intraday_active", False)), ROOT)
-    buy = d["PHASE NUOVA"].isin(["BUY1","BUY2","BUY3"])
+    buy = d["PHASE NUOVA"].isin(["BUY1","BUY2","BUY3","BUY1(PR)","BUY2(PR)","BUY3(PR)"])
     d["_group"] = (~buy).astype(int)
     d["_phase"] = d["PHASE NUOVA"].map({'TREND_RIALZISTA': 1, 'DEBOLEZZA_RIALZISTA': 2, 'DEBOLEZZA_RIBASSISTA': 3, 'TREND_RIBASSISTA': 4, 'SELL1': 5, 'SELL2': 6, 'SELL3': 7, 'INDECISIONE': 8}).fillna(9)
     d["_rating"] = pd.to_numeric(d["RATING"],errors="coerce").where(buy)
@@ -1260,7 +1262,7 @@ if page.startswith('◈'):
 
     # Filtri direttamente nelle intestazioni AG Grid.
     filtered=full.copy()
-    all_buys=full['PHASE NUOVA'].isin(['BUY1','BUY2','BUY3'])
+    all_buys=full['PHASE NUOVA'].isin(['BUY1','BUY2','BUY3','BUY1(PR)','BUY2(PR)','BUY3(PR)'])
     metrics=st.columns(4,gap='small')
     metrics[0].metric('Titoli monitorati',f'{len(full)}')
     metrics[1].metric('Segnali BUY',f'{all_buys.sum()}')
@@ -1336,7 +1338,7 @@ if page.startswith('◈'):
 else:
     st.markdown('<div class="ms-watch-section">WATCH LIST DAILY <span>· SEGNALI GIORNALIERI</span></div>',unsafe_allow_html=True)
     dw=load_daily_unified(use_intraday=st.session_state.get("ms_scientific_intraday_active", False))
-    dw=dw.loc[dw['PHASE NUOVA'].isin(['BUY1','BUY2','BUY3']) & (dw['RATING']>=7)]
+    dw=dw.loc[dw['PHASE NUOVA'].isin(['BUY1','BUY2','BUY3','BUY1(PR)','BUY2(PR)','BUY3(PR)']) & (dw['RATING']>=7)]
     st.metric('TITOLI WATCH LIST DAILY',len(dw))
     st.caption(
         "Ultimo aggiornamento DAILY: "
@@ -1401,7 +1403,7 @@ else:
         wdate=None
         st.error('Impossibile caricare la Watch List: '+str(exc))
     w=wf.loc[
-        wf['PHASE NUOVA'].isin(['BUY1','BUY2','BUY3'])
+        wf['PHASE NUOVA'].isin(['BUY1','BUY2','BUY3','BUY1(PR)','BUY2(PR)','BUY3(PR)'])
         & (pd.to_numeric(wf['RATING'],errors='coerce')>=7)
     ].copy().sort_values(['RATING','NOME TITOLO'],ascending=[False,True])
     n=len(w)

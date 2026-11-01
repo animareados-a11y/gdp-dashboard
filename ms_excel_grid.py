@@ -2,7 +2,7 @@
 import pandas as pd
 from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 
-BUY = ('BUY1', 'BUY2', 'BUY3')
+BUY = ('BUY1', 'BUY2', 'BUY3', 'BUY1(PR)', 'BUY2(PR)', 'BUY3(PR)')
 
 
 def show_grid(df, key):
@@ -13,12 +13,12 @@ def show_grid(df, key):
         view['MERCATO'] = view['MERCATO'].astype('string').str.replace(r'^USA.*$', 'USA', regex=True)
     if daily:
         view = view.rename(columns={'PHASE NUOVA': 'PHASE DAILY', 'RATING': 'RATING DAILY'})
-        wanted = ['NOME TITOLO','MERCATO','PHASE DAILY','RATING DAILY','PHASE WEEKLY','RATING WEEKLY','RENDIMENTO ATTESO','DATA']
+        wanted = ['NOME TITOLO','PREZZO','MERCATO','PHASE DAILY','RATING DAILY','PHASE WEEKLY','RATING WEEKLY','RENDIMENTO ATTESO','DATA']
     else:
         view = view.rename(columns={'PHASE NUOVA': 'PHASE WEEKLY', 'RATING': 'RATING WEEKLY'})
-        wanted = ['NOME TITOLO','MERCATO','PHASE WEEKLY','RATING WEEKLY','RENDIMENTO ATTESO','DATA']
+        wanted = ['NOME TITOLO','PREZZO','MERCATO','PHASE WEEKLY','RATING WEEKLY','RENDIMENTO ATTESO','DATA']
     view = view[[c for c in wanted if c in view.columns]]
-    for c in ('RATING DAILY','RATING WEEKLY','RENDIMENTO ATTESO'):
+    for c in ('PREZZO','RATING DAILY','RATING WEEKLY','RENDIMENTO ATTESO'):
         if c in view:
             view[c] = pd.to_numeric(view[c], errors='coerce')
     if 'DATA' in view:
@@ -31,12 +31,53 @@ def show_grid(df, key):
     gb.configure_grid_options(domLayout='normal', suppressHorizontalScroll=False,
                               alwaysShowHorizontalScroll=True, alwaysShowVerticalScroll=True)
     gb.configure_column('NOME TITOLO', header_name='TITOLO', pinned='left', minWidth=145)
+    if "PREZZO" in view:
+        gb.configure_column(
+            "PREZZO", type=["numericColumn"],
+            filter="agNumberColumnFilter", minWidth=100,
+            valueFormatter=JsCode(
+                "function(p){if(p.value == null)return 'N/D';"
+                "const m=String(p.data.MERCATO||'').toUpperCase();"
+                "return (m.startsWith('USA')?'$ ':'€ ')+Number(p.value).toFixed(2);}"
+            )
+        )
     # AG Grid Set Filter is an Enterprise feature. Enable enterprise modules to show
     # the Excel-style checkbox menu; production use may require an AG Grid licence.
     for c in ('MERCATO','PHASE DAILY','PHASE WEEKLY','DATA'):
         if c in view:
             gb.configure_column(c, filter='agSetColumnFilter', filterParams={'buttons':['reset','apply'], 'closeOnApply':True})
-    buy_style = JsCode("""function(p) { return ['BUY1','BUY2','BUY3'].includes(p.value) ? {'backgroundColor':'#d9f5e9','color':'#075c43','fontWeight':'bold'} : (String(p.value||'').startsWith('SELL') ? {'backgroundColor':'#fde7e8','color':'#922f38'} : {}); }""")
+    # MS_DAILY_BULLISH_CONFLUENCE_YELLOW_V1
+    # Evidenzia solo le righe DAILY in cui entrambe le PHASE sono rialziste.
+    bullish_js = """function(p) {
+        if (!p || !p.data) return false;
+        const allowed = ['BUY1','BUY2','BUY3','BUY1(PR)','BUY2(PR)','BUY3(PR)','TREND_RIALZISTA','DEBOLEZZA_RIALZISTA'];
+        const norm = (x) => String(x == null ? '' : x).trim().toUpperCase()
+            .replace(/\s+/g, '_').replace(/^(BUY|SELL)_(\d)$/, '$1$2');
+        return allowed.includes(norm(p.data['PHASE DAILY'])) &&
+               allowed.includes(norm(p.data['PHASE WEEKLY']));
+    }"""
+    if daily and 'PHASE DAILY' in view and 'PHASE WEEKLY' in view:
+        gb.configure_grid_options(getRowStyle=JsCode("""function(p) {
+            const allowed = ['BUY1','BUY2','BUY3','BUY1(PR)','BUY2(PR)','BUY3(PR)','TREND_RIALZISTA','DEBOLEZZA_RIALZISTA'];
+            const norm = (x) => String(x == null ? '' : x).trim().toUpperCase()
+                .replace(/\s+/g, '_').replace(/^(BUY|SELL)_(\d)$/, '$1$2');
+            return p.data && allowed.includes(norm(p.data['PHASE DAILY'])) &&
+                allowed.includes(norm(p.data['PHASE WEEKLY'])) ?
+                {'backgroundColor':'#fff2a8','color':'#242424'} : undefined;
+        }"""))
+    buy_style = JsCode("""function(p) {
+        const allowed = ['BUY1','BUY2','BUY3','BUY1(PR)','BUY2(PR)','BUY3(PR)','TREND_RIALZISTA','DEBOLEZZA_RIALZISTA'];
+        const norm = (x) => String(x == null ? '' : x).trim().toUpperCase()
+            .replace(/\s+/g, '_').replace(/^(BUY|SELL)_(\d)$/, '$1$2');
+        if (p.data && p.data['PHASE DAILY'] != null && p.data['PHASE WEEKLY'] != null &&
+            allowed.includes(norm(p.data['PHASE DAILY'])) &&
+            allowed.includes(norm(p.data['PHASE WEEKLY']))) {
+            return {'backgroundColor':'#fff2a8','color':'#242424','fontWeight':'bold'};
+        }
+        return ['BUY1','BUY2','BUY3','BUY1(PR)','BUY2(PR)','BUY3(PR)'].includes(p.value) ?
+            {'backgroundColor':'#d9f5e9','color':'#075c43','fontWeight':'bold'} :
+            (String(p.value||'').startsWith('SELL') ? {'backgroundColor':'#fde7e8','color':'#922f38'} : {});
+    }""")
     for c in ('PHASE DAILY','PHASE WEEKLY'):
         if c in view:
             gb.configure_column(c, cellStyle=buy_style, minWidth=175)
