@@ -1338,7 +1338,7 @@ if page.startswith('◈'):
 else:
     st.markdown('<div class="ms-watch-section">WATCH LIST DAILY <span>· SEGNALI GIORNALIERI</span></div>',unsafe_allow_html=True)
     dw=load_daily_unified(use_intraday=st.session_state.get("ms_scientific_intraday_active", False))
-    dw=dw.loc[dw['PHASE NUOVA'].isin(['BUY1','BUY2','BUY3','BUY1(PR)','BUY2(PR)','BUY3(PR)']) & (dw['RATING']>=7)]
+    dw=dw.loc[dw['PHASE NUOVA'].isin(['BUY1','BUY2','BUY3']) & (dw['RATING']>=7)]
     st.metric('TITOLI WATCH LIST DAILY',len(dw))
     st.caption(
         "Ultimo aggiornamento DAILY: "
@@ -1403,7 +1403,7 @@ else:
         wdate=None
         st.error('Impossibile caricare la Watch List: '+str(exc))
     w=wf.loc[
-        wf['PHASE NUOVA'].isin(['BUY1','BUY2','BUY3','BUY1(PR)','BUY2(PR)','BUY3(PR)'])
+        wf['PHASE NUOVA'].isin(['BUY1','BUY2','BUY3'])
         & (pd.to_numeric(wf['RATING'],errors='coerce')>=7)
     ].copy().sort_values(['RATING','NOME TITOLO'],ascending=[False,True])
     n=len(w)
