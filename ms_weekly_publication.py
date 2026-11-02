@@ -21,6 +21,7 @@ def weekly_science_fingerprint():
 
     sources = (
         "weekly_v40_39_phase_canonical.py",
+        "weekly_v40_5_phase_dynamics_shadow.py",
         "weekly_v40_5_phase_dynamics_shadow_v5.py",
         "weekly_v40_5_phase_dynamics_shadow_v4.py",
         "operational/incremental_phase.py",

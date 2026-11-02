@@ -58,6 +58,9 @@ def identify_changed_tickers(market):
     if not history_path.exists():
         return set(prices["Ticker"].unique())
 
+    if os.environ.get("MS_WEEKLY_FORCE_PHASE_RECALC") == "1":
+        return set(prices["Ticker"].unique())
+
     history = pd.read_csv(
         history_path,
         usecols=["Ticker", "Date"]
