@@ -657,25 +657,56 @@ def run_scientific_intraday():
 
 
 def overlay_scientific_intraday(d):
-    """Sovrappone soltanto risultati DAILY scientifici completi e coerenti."""
+    """Mostra i risultati DAILY provvisori senza modificare il consolidato."""
     path = ROOT / "data" / "marketsentinel_intraday" / "marketsentinel_intraday.csv"
     live = pd.read_csv(path)
-    cols = ["Ticker", "PHASE_NUOVA", "RATING_V160", "Close", "Date"]
-    missing = set(cols) - set(live.columns)
+
+    required = {
+        "Ticker", "PHASE_NUOVA", "RATING_V160", "Close", "Date"
+    }
+    missing = required - set(live.columns)
     if missing:
-        raise ValueError(f"Colonne scientifiche intraday mancanti: {sorted(missing)}")
+        raise ValueError(
+            f"Colonne scientifiche intraday mancanti: {sorted(missing)}"
+        )
+
     if len(live) != 199 or not live["Ticker"].is_unique:
         raise ValueError("Risultato intraday non valido: attesi 199 ticker univoci")
+
     if set(live["Ticker"]) != set(d["Ticker"]):
         raise ValueError("Ticker intraday diversi da quelli del DAILY consolidato")
+
     live = live.set_index("Ticker")
     d = d.copy().set_index("Ticker")
-    # Le classificazioni scientifiche consolidate, incluso PR,
-    # non devono essere sovrascritte dai risultati intraday precedenti.
-    # L'intraday mantiene esclusivamente il prezzo provvisorio.
-    d["PREZZO INTRADAY"] = live["Close"].reindex(d.index)
-    d = d.reset_index()
-    return d
+    live = live.reindex(d.index)
+
+    consolidated_dates = pd.to_datetime(
+        d["Date"], utc=True, format="mixed", errors="coerce"
+    )
+    provisional_dates = pd.to_datetime(
+        live["Date"], utc=True, format="mixed", errors="coerce"
+    )
+
+    if (
+        consolidated_dates.isna().any()
+        or provisional_dates.isna().any()
+        or (provisional_dates < consolidated_dates).any()
+    ):
+        raise ValueError("Date DAILY provvisorie non coerenti")
+
+    # Prezzo provvisorio distinto dal consolidato.
+    d["PREZZO INTRADAY"] = pd.to_numeric(
+        live["Close"], errors="coerce"
+    )
+
+    # Risultati scientifici del medesimo calcolo provvisorio.
+    for col in ("PHASE_NUOVA", "RATING_V160", "Date"):
+        d[col] = live[col]
+
+    # Prezzo coerente con PHASE, rating e data provvisori.
+    d["Close"] = pd.to_numeric(live["Close"], errors="coerce")
+
+    return d.reset_index()
 
 
 def load_daily_unified(use_intraday=False):
