@@ -73,7 +73,7 @@ def main():
 
         required_columns = {
             "Ticker", "Date", "PHASE", "Close",
-            "SAR", "SAR_FLIP_UP", "V4015_HA_DIRECTION",
+            "SAR", "SAR_SIDE", "SAR_FLIP_UP", "V4015_HA_DIRECTION", "V4015_HA_INDECISION",
             "V4015_ATR_PCT",
             "V4012_SAR_DISTANCE_PCT",
             "V4015_BB_WIDTH_PCT",
