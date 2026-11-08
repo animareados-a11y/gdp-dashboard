@@ -5,18 +5,24 @@ from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 BUY = ('BUY1', 'BUY2', 'BUY3', 'BUY1(PR)', 'BUY2(PR)', 'BUY3(PR)')
 
 
-def show_grid(df, key):
+def show_grid(df, key, portfolio_mode=False):
     view = df.copy()
     view = view.loc[:, ~view.columns.duplicated()].reset_index(drop=True)
     daily = 'PHASE WEEKLY' in view.columns
     if 'MERCATO' in view:
         view['MERCATO'] = view['MERCATO'].astype('string').str.replace(r'^USA.*$', 'USA', regex=True)
     if daily:
-        view = view.rename(columns={'PHASE NUOVA': 'PHASE DAILY', 'RATING': 'RATING DAILY'})
+        rename = {}
+        if 'PHASE DAILY' not in view.columns:
+            rename['PHASE NUOVA'] = 'PHASE DAILY'
+        if 'RATING DAILY' not in view.columns:
+            rename['RATING'] = 'RATING DAILY'
+        view = view.rename(columns=rename)
         wanted = ['NOME TITOLO','PREZZO','MERCATO','PHASE DAILY','RATING DAILY','PHASE WEEKLY','RATING WEEKLY','RENDIMENTO ATTESO','DATA']
     else:
         view = view.rename(columns={'PHASE NUOVA': 'PHASE WEEKLY', 'RATING': 'RATING WEEKLY'})
         wanted = ['NOME TITOLO','PREZZO','MERCATO','PHASE WEEKLY','RATING WEEKLY','RENDIMENTO ATTESO','DATA']
+    view = view.loc[:, ~view.columns.duplicated()]
     view = view[[c for c in wanted if c in view.columns]]
     for c in ('PREZZO','RATING DAILY','RATING WEEKLY','RENDIMENTO ATTESO'):
         if c in view:
@@ -30,6 +36,28 @@ def show_grid(df, key):
     gb.configure_pagination(enabled=False)
     gb.configure_grid_options(domLayout='normal', suppressHorizontalScroll=False,
                               alwaysShowHorizontalScroll=True, alwaysShowVerticalScroll=True)
+    if portfolio_mode and daily:
+        view.insert(0, 'P', 'P')
+        gb = GridOptionsBuilder.from_dataframe(view)
+        gb.configure_default_column(sortable=True, resizable=True, filter=True, minWidth=110)
+        gb.configure_grid_options(
+            animateRows=True,
+            enableCellTextSelection=True,
+            suppressRowClickSelection=True,
+            rowSelection='single',
+            pagination=False,
+            domLayout='normal',
+            suppressHorizontalScroll=False,
+            alwaysShowHorizontalScroll=True,
+            alwaysShowVerticalScroll=True,
+        )
+        gb.configure_column(
+            'P', header_name='P', pinned='left',
+            width=55, minWidth=55, maxWidth=55,
+            sortable=False, filter=False,
+            checkboxSelection=True,
+            headerCheckboxSelection=False,
+        )
     gb.configure_column('NOME TITOLO', header_name='TITOLO', pinned='left', minWidth=145)
     if "PREZZO" in view:
         gb.configure_column(
@@ -101,6 +129,7 @@ def show_grid(df, key):
         '.ag-root-wrapper ::-webkit-scrollbar-track': {'background-color': '#dce8ee'},
     }
     return AgGrid(view, gridOptions=gb.build(), theme='alpine', height=660, key=key,
+                  update_on=['selectionChanged'] if portfolio_mode and daily else [],
                   custom_css=scrollbar_css,
                   allow_unsafe_jscode=True, enable_enterprise_modules=True,
                   fit_columns_on_grid_load=False)

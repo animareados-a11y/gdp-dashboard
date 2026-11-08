@@ -74,6 +74,8 @@ def main():
         required_columns = {
             "Ticker", "Date", "PHASE", "Close",
             "SAR", "SAR_SIDE", "SAR_FLIP_UP", "V4015_HA_DIRECTION", "V4015_HA_INDECISION",
+            "V4015_HA_CLOSE",
+            "V4015_BB_MID",
             "V4015_ATR_PCT",
             "V4012_SAR_DISTANCE_PCT",
             "V4015_BB_WIDTH_PCT",
@@ -134,8 +136,8 @@ def main():
     )
 
     # PR WEEKLY: MA52, applicata dopo PHASE NUOVA scientifica.
-    from ms_pr_filter import apply_pr_filter
-    history = apply_pr_filter(history, timeframe="WEEKLY")
+    from ms_pr_unified import apply_pr_unified
+    history = apply_pr_unified(history, timeframe="WEEKLY")
     phase = history["PHASE_PRE_PR"]
 
     history["RATING_V160"] = np.select(

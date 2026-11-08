@@ -40,7 +40,7 @@ class _InternalLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         if key == "operational/run_marketsentinel.py":
             # PR: integrazione nel runner scientifico incorporato.
             # Il filtro interviene dopo PHASE_NUOVA, senza modificare SAR/HA.
-            from ms_pr_filter import apply_pr_filter
+            from ms_pr_unified import apply_pr_unified
 
             anchor = '    phase = history["PHASE_NUOVA"]'
             if code.count(anchor) != 1:
@@ -48,8 +48,8 @@ class _InternalLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 
             code = code.replace(
                 anchor,
-                '    from ms_pr_filter import apply_pr_filter\n'
-                '    history = apply_pr_filter(history, timeframe="DAILY")\n'
+                '    from ms_pr_unified import apply_pr_unified\n'
+                '    history = apply_pr_unified(history, timeframe="DAILY")\n'
                 '    phase = history["PHASE_PRE_PR"]'
             )
 
