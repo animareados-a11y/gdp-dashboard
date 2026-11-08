@@ -670,28 +670,54 @@ def ms_display_price_time():
     return datetime.fromtimestamp(p.stat().st_mtime).strftime("%d/%m/%Y ore %H:%M")
 
 
-def ms_card_rsi_values():
-    """RSI scientifici pubblicati, lettura senza scritture."""
-    from ms_weekly_source_selector import select_weekly_source
-    daily_base = ROOT / "data" / "marketsentinel_daily"
-    weekly_base, _, _ = select_weekly_source()
+@st.cache_data(show_spinner=False, max_entries=3)
+def _ms_card_rsi_cached(file_signature):
+    """RSI pubblicati: cache invalidata alla modifica degli archivi."""
     result = {}
-    for timeframe, base in (("DAILY", daily_base), ("WEEKLY", weekly_base)):
+    for timeframe, paths in file_signature:
         values = {}
-        for market in ("italy40", "europe40", "usa80", "usa40"):
+        for filename, _, _ in paths:
             df = pd.read_csv(
-                base / f"{market}_v160_features.csv",
+                filename,
                 usecols=["Ticker", "Date", "V4015_RSI"],
                 low_memory=False
             )
-            df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce")
-            latest = df.sort_values("Date").drop_duplicates("Ticker", keep="last")
+            df["Date"] = pd.to_datetime(
+                df["Date"], utc=True, errors="coerce"
+            )
+            latest = df.sort_values("Date").drop_duplicates(
+                "Ticker", keep="last"
+            )
             for _, row in latest.iterrows():
-                value = pd.to_numeric(row["V4015_RSI"], errors="coerce")
+                value = pd.to_numeric(
+                    row["V4015_RSI"], errors="coerce"
+                )
                 if pd.notna(value) and 0 <= value <= 100:
                     values[str(row["Ticker"]).strip().upper()] = float(value)
         result[timeframe] = values
     return result
+
+
+def ms_card_rsi_values():
+    """RSI scientifici con aggiornamento automatico della cache."""
+    from ms_weekly_source_selector import select_weekly_source
+
+    daily_base = ROOT / "data" / "marketsentinel_daily"
+    weekly_base, _, _ = select_weekly_source()
+
+    signature = []
+    for timeframe, base in (
+        ("DAILY", daily_base),
+        ("WEEKLY", weekly_base)
+    ):
+        files = []
+        for market in ("italy40", "europe40", "usa80", "usa40"):
+            path = base / f"{market}_v160_features.csv"
+            stat = path.stat()
+            files.append((str(path), stat.st_mtime_ns, stat.st_size))
+        signature.append((timeframe, tuple(files)))
+
+    return _ms_card_rsi_cached(tuple(signature))
 
 
 def ms_card_rsi_html(ticker, timeframe, rsi_values):
