@@ -19,7 +19,7 @@ def apply_pr_unified(df, timeframe="DAILY", phase_col="PHASE_NUOVA"):
 
     required = {
         "Ticker", "Date", "Close", phase_col,
-        "V4015_HA_CLOSE", "V4015_BB_MID",
+        "V4015_HA_OPEN", "V4015_HA_CLOSE", "V4015_BB_MID",
     }
     missing = required.difference(df.columns)
     if missing:
@@ -31,6 +31,7 @@ def apply_pr_unified(df, timeframe="DAILY", phase_col="PHASE_NUOVA"):
 
     close = pd.to_numeric(out["Close"], errors="coerce")
     ha = pd.to_numeric(out["V4015_HA_CLOSE"], errors="coerce")
+    ha_open = pd.to_numeric(out["V4015_HA_OPEN"], errors="coerce")
     bb_mid = pd.to_numeric(out["V4015_BB_MID"], errors="coerce")
 
     long_window = 365 if timeframe == "DAILY" else 52
@@ -53,9 +54,23 @@ def apply_pr_unified(df, timeframe="DAILY", phase_col="PHASE_NUOVA"):
         ).mean()
     )
 
+    previous_mid = bb_mid.groupby(out["Ticker"]).shift(1)
+    out["SMA20_DECLINING"] = (
+        bb_mid.notna()
+        & previous_mid.notna()
+        & bb_mid.lt(previous_mid)
+    )
+    out["SMA20_BODY_CROSS"] = (
+        ha_open.notna()
+        & ha.notna()
+        & bb_mid.notna()
+        & ha.gt(ha_open)
+        & ha_open.le(bb_mid)
+        & bb_mid.lt(ha)
+    )
     out["SMA20_PR_ON"] = (
         close.lt(out["SMA_PR_LONG"])
-        & ha.le(bb_mid)
+        & out["SMA20_DECLINING"]
     ).fillna(False)
 
     out["PR_CONDITION"] = (
@@ -71,14 +86,15 @@ def apply_pr_unified(df, timeframe="DAILY", phase_col="PHASE_NUOVA"):
         stage = 0
         for pos in positions:
             scientific = str(out.at[pos, "PHASE_PRE_PR"])
-            condition = bool(out.at[pos, "PR_CONDITION"])
+            ma_pr = bool(out.at[pos, "PR_MA_ON"])
+            falling = bool(out.at[pos, "SMA20_DECLINING"])
+            secondary = out.at[pos, "SMA_PR_LONG"]
+            below = pd.notna(secondary) and close.iloc[pos] < secondary
 
-            if stage == 0:
-                if scientific == "BUY1" and condition:
-                    stage = 1
-                    out.at[pos, phase_col] = "BUY1(PR)"
-                    out.at[pos, "PR_APPLIED"] = True
-                continue
+            # SMA365/52 resta una condizione PR indipendente.
+            # Sotto SMA200/40, SMA20 decrescente impedisce BUY puliti.
+            force_pr = bool(below and falling)
+            condition = ma_pr or force_pr
 
             if scientific in BEARISH or scientific in (
                 "DEBOLEZZA_RIALZISTA", "INDECISIONE"
@@ -87,13 +103,19 @@ def apply_pr_unified(df, timeframe="DAILY", phase_col="PHASE_NUOVA"):
                 continue
 
             if scientific == "BUY1":
-                stage = 0
                 if condition:
                     stage = 1
                     out.at[pos, phase_col] = "BUY1(PR)"
                     out.at[pos, "PR_APPLIED"] = True
+                else:
+                    stage = 0
                 continue
 
+            if stage == 0:
+                continue
+
+            # La progressione PR non dipende dal superamento
+            # della SMA20: conta la sequenza scientifica.
             if stage == 1 and scientific == "BUY2":
                 stage = 2
                 out.at[pos, phase_col] = "BUY2(PR)"
