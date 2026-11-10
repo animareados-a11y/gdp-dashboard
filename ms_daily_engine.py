@@ -50,6 +50,8 @@ class _InternalLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                 anchor,
                 '    from ms_pr_unified import apply_pr_unified\n'
                 '    history = apply_pr_unified(history, timeframe="DAILY")\n'
+                '    from ms_buy_sequence_guard import apply_buy_sequence_guard\n'
+                '    history = apply_buy_sequence_guard(history)\n'
                 '    phase = history["PHASE_NUOVA"].astype(str).str.replace("(PR)", "", regex=False)'
             )
 
