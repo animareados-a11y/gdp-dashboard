@@ -138,7 +138,11 @@ def main():
     # PR WEEKLY: MA52, applicata dopo PHASE NUOVA scientifica.
     from ms_pr_unified import apply_pr_unified
     history = apply_pr_unified(history, timeframe="WEEKLY")
-    phase = history["PHASE_PRE_PR"]
+    phase = (
+        history["PHASE_NUOVA"]
+        .astype(str)
+        .str.replace("(PR)", "", regex=False)
+    )
 
     history["RATING_V160"] = np.select(
         [

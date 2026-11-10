@@ -50,7 +50,7 @@ class _InternalLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                 anchor,
                 '    from ms_pr_unified import apply_pr_unified\n'
                 '    history = apply_pr_unified(history, timeframe="DAILY")\n'
-                '    phase = history["PHASE_PRE_PR"]'
+                '    phase = history["PHASE_NUOVA"].astype(str).str.replace("(PR)", "", regex=False)'
             )
 
             old_check = 'data["Ticker"].nunique() != 200'
@@ -88,6 +88,10 @@ def run_embedded(name):
     if key not in _SOURCES: raise RuntimeError('Modulo interno assente: '+key)
     scope = {'__name__':'__main__','__file__':str(ROOT/key),'__package__':'operational'}
     source = _SOURCES[key]
+    if key == "operational/run_marketsentinel.py":
+        import operational.run_marketsentinel as aggregator
+        aggregator.main()
+        return
     if key == "operational/update_phase_usa40.py":
         source = source.replace("assert len(current_df) == 40", "assert len(current_df) == 39")
         source = source.replace('assert current_df["Ticker"].nunique() == 40', 'assert current_df["Ticker"].nunique() == 39')
@@ -237,8 +241,7 @@ def recalculate(progress):
             progress.progress(0.44 + 0.45 * len(results) / len(prefixes),
                 text=f'PHASE + V160 completati: {len(results)}/4 mercati · ultimo: {name} ({total_seconds:.1f}s)')
     progress.progress(0.92, text='Aggregazione finale PHASE NUOVA e rating V160')
-    from operational.run_marketsentinel import main
-    main()
+    run_embedded("run_marketsentinel")
     progress.progress(1.0, text=f'PHASE NUOVA e V160 completati in {time.perf_counter()-start:.1f}s')
     return results
 

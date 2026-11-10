@@ -54,6 +54,18 @@ def apply_pr_unified(df, timeframe="DAILY", phase_col="PHASE_NUOVA"):
         ).mean()
     )
 
+    # Pendenza significativa SMA200 DAILY / SMA40 WEEKLY.
+    # Oscillazioni entro +/-1% nel periodo sono considerate fisiologiche.
+    slope_period = 10 if timeframe == "DAILY" else 4
+    previous_secondary = out.groupby("Ticker")["SMA_PR_LONG"].shift(slope_period)
+    out["SMA_PR_SLOPE_PCT"] = (
+        (out["SMA_PR_LONG"] / previous_secondary - 1.0) * 100.0
+    )
+    out["SMA_PR_DECLINING"] = (
+        previous_secondary.gt(0)
+        & out["SMA_PR_SLOPE_PCT"].lt(-1.0)
+    ).fillna(False)
+
     previous_mid = bb_mid.groupby(out["Ticker"]).shift(1)
     out["SMA20_DECLINING"] = (
         bb_mid.notna()
@@ -71,6 +83,7 @@ def apply_pr_unified(df, timeframe="DAILY", phase_col="PHASE_NUOVA"):
     out["SMA20_PR_ON"] = (
         close.lt(out["SMA_PR_LONG"])
         & out["SMA20_DECLINING"]
+        & out["SMA_PR_DECLINING"]
     ).fillna(False)
 
     out["PR_CONDITION"] = (
@@ -84,8 +97,17 @@ def apply_pr_unified(df, timeframe="DAILY", phase_col="PHASE_NUOVA"):
 
     for _, positions in out.groupby("Ticker", sort=False).groups.items():
         stage = 0
+        clean_stage = 0
         for pos in positions:
             scientific = str(out.at[pos, "PHASE_PRE_PR"])
+            sar = pd.to_numeric(out.at[pos, "SAR_SIDE"], errors="coerce")
+            ha_dir = pd.to_numeric(
+                out.at[pos, "V4015_HA_DIRECTION"], errors="coerce"
+            )
+            indecision = pd.to_numeric(
+                out.at[pos, "V4015_HA_INDECISION"], errors="coerce"
+            )
+            bullish = sar == 1 and ha_dir == 1 and indecision == 0
             ma_pr = bool(out.at[pos, "PR_MA_ON"])
             falling = bool(out.at[pos, "SMA20_DECLINING"])
             secondary = out.at[pos, "SMA_PR_LONG"]
@@ -93,8 +115,52 @@ def apply_pr_unified(df, timeframe="DAILY", phase_col="PHASE_NUOVA"):
 
             # SMA365/52 resta una condizione PR indipendente.
             # Sotto SMA200/40, SMA20 decrescente impedisce BUY puliti.
-            force_pr = bool(below and falling)
+            force_pr = bool(
+                below and falling and out.at[pos, "SMA_PR_DECLINING"]
+            )
             condition = ma_pr or force_pr
+
+            # Uscita PR: prezzo sopra entrambe le medie.
+            # DAILY: SMA20 + SMA200
+            # WEEKLY: SMA20 + SMA40
+            above_both = (
+                pd.notna(secondary)
+                and pd.notna(bb_mid.iloc[pos])
+                and close.iloc[pos] > secondary
+                and close.iloc[pos] > bb_mid.iloc[pos]
+            )
+            if above_both:
+                if stage > 0 and bullish and scientific in (
+                    "BUY1", "BUY2", "BUY3", "TREND_RIALZISTA"
+                ):
+                    clean_stage = 1
+                    out.at[pos, phase_col] = "BUY1"
+                    out.at[pos, "PHASE_NUOVA_REASON"] = "PR_EXIT_RESTART_BUY1"
+                stage = 0
+                if clean_stage == 0:
+                    continue
+
+            if clean_stage:
+                compatible = scientific in (
+                    "BUY1", "BUY2", "BUY3",
+                    "TREND_RIALZISTA", "DEBOLEZZA_RIALZISTA"
+                )
+                if not bullish or not compatible:
+                    clean_stage = 0
+                elif out.at[pos, "PHASE_NUOVA_REASON"] == "PR_EXIT_RESTART_BUY1":
+                    continue
+                elif clean_stage < 3:
+                    clean_stage += 1
+                    out.at[pos, phase_col] = f"BUY{clean_stage}"
+                    out.at[pos, "PHASE_NUOVA_REASON"] = "PR_EXIT_BUY_PROGRESS"
+                    continue
+                elif scientific == "TREND_RIALZISTA":
+                    clean_stage = 0
+                    out.at[pos, phase_col] = "TREND_RIALZISTA"
+                    continue
+                else:
+                    out.at[pos, phase_col] = "BUY3"
+                    continue
 
             if scientific in BEARISH or scientific in (
                 "DEBOLEZZA_RIALZISTA", "INDECISIONE"
@@ -122,9 +188,7 @@ def apply_pr_unified(df, timeframe="DAILY", phase_col="PHASE_NUOVA"):
             elif stage == 2 and scientific == "BUY3":
                 stage = 3
                 out.at[pos, phase_col] = "BUY3(PR)"
-            elif stage >= 3 and scientific in (
-                "BUY2", "BUY3", "TREND_RIALZISTA"
-            ):
+            elif stage >= 3 and scientific == "TREND_RIALZISTA":
                 stage = 4
                 out.at[pos, phase_col] = "TREND_RIALZISTA(PR)"
             else:
