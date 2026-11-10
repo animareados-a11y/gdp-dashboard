@@ -1923,7 +1923,7 @@ else:
 
                 rd = recommended_daily.loc[
                     recommended_daily["PHASE NUOVA"].isin(daily_allowed),
-                    ["NOME TITOLO", "MERCATO", "PHASE NUOVA", "PREZZO", "RENDIMENTO ATTESO", "DATA"]
+                    ["NOME TITOLO", "MERCATO", "PHASE NUOVA", "PREZZO", "RENDIMENTO ATTESO", "DATA", "RATING"]
                 ].copy()
 
                 rw = recommended_weekly.loc[
@@ -2045,6 +2045,31 @@ else:
                             else "#9cb7cb"
                         )
 
+                        rating = pd.to_numeric(r["RATING"], errors="coerce")
+                        rating_valid = pd.notna(rating) and 0 <= rating <= 10
+                        rating_text = f"{rating:.2f}" if rating_valid else "N/D"
+                        rating_width = f"{rating * 10:.1f}%" if rating_valid else "0%"
+                        rating_color = "#4be0bd" if rating_valid else "#9cb7cb"
+
+                        rating_html = ""
+                        if rating_valid:
+                            rating_html = (
+                                '<div style="padding:10px 12px;margin:10px 0;'
+                                'background:#10283b;border:1px solid #35566b;'
+                                'border-radius:10px">'
+                                '<div style="font-size:10px;font-weight:800;'
+                                'letter-spacing:.07em;color:#a8c5d6">'
+                                'RATING V160 DAILY</div>'
+                                f'<div style="font-size:28px;font-weight:900;color:{rating_color}">'
+                                f'{rating_text}<span style="font-size:12px;color:#9cb7cb"> / 10</span>'
+                                '</div>'
+                                '<div style="height:7px;background:#30495b;'
+                                'border-radius:8px;overflow:hidden">'
+                                f'<div style="width:{rating_width};height:100%;'
+                                f'background:{rating_color};border-radius:8px"></div>'
+                                '</div></div>'
+                            )
+
                         card = f"""<div class="ms-wcard">
                           <div class="ms-wcard-top">
                             <span class="ms-wrank">#{i+1:02d} / CONSIGLIATI</span>
@@ -2063,6 +2088,7 @@ else:
                             </div>
                           </div>
                           <div class="ms-wline"></div>
+                          {rating_html}
                           {ms_card_rsi_html(ticker, "DAILY", ms_rsi_values)}
                           {ms_card_rsi_html(ticker, "WEEKLY", ms_rsi_values)}
                           <div class="ms-wsmall">PREZZO DAILY</div>
@@ -2080,7 +2106,10 @@ else:
                         </div>"""
 
                         with recommended_cols[i % 3]:
-                            st.markdown(card, unsafe_allow_html=True)
+                            st.markdown(
+                                "".join(line.strip() for line in card.splitlines()),
+                                unsafe_allow_html=True
+                            )
 
             except Exception as exc:
                 st.error("CONSIGLIATI: impossibile incrociare DAILY e WEEKLY: "
