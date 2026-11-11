@@ -102,6 +102,14 @@ def run():
             "OHLCV DAILY o definitiva modificati durante il calcolo"
         )
 
+    # Riepilogo RSI della versione scientifica appena completata.
+    from ms_rsi_snapshot import build as build_rsi_snapshot
+    try:
+        build_rsi_snapshot(version)
+        print("RSI WEEKLY: riepilogo verificato", flush=True)
+    except Exception as exc:
+        print(f"AVVISO RSI WEEKLY: {exc}", flush=True)
+
     published, reference = publish_version(
         version,
         daily_ohlcv_fingerprint=input_before[2],

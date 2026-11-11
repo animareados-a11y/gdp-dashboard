@@ -18,6 +18,17 @@ def main():
     cutoff, elapsed, needs_calculation = update_daily_prices(bar)
     if needs_calculation:
         recalculate(bar)
+        from ms_rsi_snapshot import build
+        from ms_daily_engine import ROOT
+        for folder in (
+            ROOT / "data/marketsentinel_daily",
+            ROOT / "data/marketsentinel_intraday/scientific_cache",
+        ):
+            try:
+                build(folder)
+                print(f"RSI aggiornati: {folder}", flush=True)
+            except Exception as exc:
+                print(f"AVVISO RSI: {folder}: {exc}", flush=True)
         refresh_targets(bar)
         print(f"DAILY COMPLETATO: {cutoff:%d/%m/%Y}", flush=True)
     else:

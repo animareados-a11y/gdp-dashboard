@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import streamlit as st
+
 from ms_analyst_consensus import get_analyst_consensus
 
 
@@ -672,42 +673,75 @@ def ms_display_price_time():
 
 @st.cache_data(show_spinner=False, max_entries=3)
 def _ms_card_rsi_cached(file_signature):
-    """RSI pubblicati: cache invalidata alla modifica degli archivi."""
+    """RSI originali: usa riepiloghi verificati, altrimenti archivi storici."""
+    from ms_rsi_snapshot import load as load_rsi_snapshot
+
     result = {}
+    grouped = {}
+
     for timeframe, paths in file_signature:
+        grouped.setdefault(timeframe, []).extend(paths)
+
+    for timeframe, paths in grouped.items():
         values = {}
-        for filename, _, _ in paths:
-            df = pd.read_csv(
-                filename,
-                usecols=["Ticker", "Date", "V4015_RSI"],
-                low_memory=False
-            )
-            df["Date"] = pd.to_datetime(
-                df["Date"], utc=True, errors="coerce"
-            )
-            latest = df.sort_values("Date").drop_duplicates(
-                "Ticker", keep="last"
-            )
-            for _, row in latest.iterrows():
-                value = pd.to_numeric(
-                    row["V4015_RSI"], errors="coerce"
-                )
-                if pd.notna(value) and 0 <= value <= 100:
-                    values[str(row["Ticker"]).strip().upper()] = float(value)
+        dates = {}
+
+        # Ogni gruppo di quattro file corrisponde a una sorgente.
+        for offset in range(0, len(paths), 4):
+            source_paths = paths[offset:offset + 4]
+            base = Path(source_paths[0][0]).parent
+            snapshot = load_rsi_snapshot(base)
+
+            if snapshot is not None:
+                rows = [
+                    (ticker, data["date"], data["rsi"])
+                    for ticker, data in snapshot.items()
+                ]
+            else:
+                rows = []
+                for filename, _, _ in source_paths:
+                    df = pd.read_csv(
+                        filename,
+                        usecols=["Ticker", "Date", "V4015_RSI"],
+                        low_memory=False
+                    )
+                    df["Date"] = pd.to_datetime(
+                        df["Date"], utc=True, errors="coerce"
+                    )
+                    latest = df.sort_values("Date").drop_duplicates(
+                        "Ticker", keep="last"
+                    )
+                    rows.extend(
+                        (row["Ticker"], row["Date"], row["V4015_RSI"])
+                        for _, row in latest.iterrows()
+                    )
+
+            for ticker_raw, date_raw, value_raw in rows:
+                ticker = str(ticker_raw).strip().upper()
+                value = pd.to_numeric(value_raw, errors="coerce")
+                date = pd.to_datetime(date_raw, utc=True, errors="coerce")
+
+                if pd.notna(value) and 0 <= value <= 100 and pd.notna(date):
+                    if ticker not in dates or date > dates[ticker]:
+                        dates[ticker] = date
+                        values[ticker] = float(value)
+
         result[timeframe] = values
+
     return result
 
-
 def ms_card_rsi_values():
-    """RSI scientifici con aggiornamento automatico della cache."""
+    """RSI scientifici DAILY aggiornati; WEEKLY consolidato."""
     from ms_weekly_source_selector import select_weekly_source
 
     daily_base = ROOT / "data" / "marketsentinel_daily"
+    scientific_base = ROOT / "data" / "marketsentinel_intraday" / "scientific_cache"
     weekly_base, _, _ = select_weekly_source()
 
     signature = []
     for timeframe, base in (
         ("DAILY", daily_base),
+        ("DAILY", scientific_base),
         ("WEEKLY", weekly_base)
     ):
         files = []
@@ -718,6 +752,7 @@ def ms_card_rsi_values():
         signature.append((timeframe, tuple(files)))
 
     return _ms_card_rsi_cached(tuple(signature))
+
 
 
 def ms_card_rsi_html(ticker, timeframe, rsi_values):
