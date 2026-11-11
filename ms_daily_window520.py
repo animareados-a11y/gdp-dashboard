@@ -21,7 +21,7 @@ def _read(path):
     d = pd.read_csv(path, low_memory=False)
     if not set(KEYS).issubset(d.columns):
         raise RuntimeError(f'Ticker/Date assenti: {path}')
-    d['Date'] = pd.to_datetime(d['Date'], utc=True, errors='raise').dt.tz_localize(None)
+    d['Date'] = pd.to_datetime(d['Date'], utc=True, errors='raise', format='mixed').dt.tz_localize(None)
     if d.duplicated(KEYS).any() or d['Date'].isna().any():
         raise RuntimeError(f'Chiavi duplicate o date nulle: {path}')
     return d.sort_values(KEYS).reset_index(drop=True)
