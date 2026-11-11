@@ -171,16 +171,17 @@ def check_weekly_refresh():
 def completed_friday_week():
     """Restituisce il venerdì consolidabile solo con 199 prezzi completi."""
     now = pd.Timestamp.now(tz="UTC")
-    today = now.normalize()
-    days_since_friday = (today.weekday() - 4) % 7
-    friday = today - pd.Timedelta(days=days_since_friday)
+    # Calendario italiano: venerdì dalle 23:00 e tutto il weekend.
+    rome_now = now.tz_convert("Europe/Rome")
+    rome_today = rome_now.normalize()
+    days_since_friday = (rome_today.weekday() - 4) % 7
+    rome_friday = rome_today - pd.Timedelta(days=days_since_friday)
 
-    # Venerdì: consolidamento consentito non prima delle 23:00 italiane.
-    # La verifica delle quotazioni rimane obbligatoria.
-    if days_since_friday == 0:
-        rome_now = now.tz_convert("Europe/Rome")
-        if rome_now.hour < 23:
-            return None
+    if days_since_friday == 0 and rome_now.hour < 23:
+        return None
+
+    # Le date delle quotazioni restano confrontate in UTC.
+    friday = pd.Timestamp(rome_friday.date(), tz="UTC")
 
     for market, expected in EXPECTED.items():
         snapshot = SNAPSHOT / f"{market}_daily_master.csv"
