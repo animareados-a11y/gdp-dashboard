@@ -93,6 +93,28 @@ def worker():
 
                 state["weekly_provisional_status"] = "skipped"
                 state["weekly_provisional_error"] = None
+
+                # Anche una WEEKLY già elaborata può diventare
+                # consolidabile dopo la chiusura del venerdì.
+                from ms_weekly_consolidation import consolidate
+                try:
+                    consolidated, message = consolidate()
+                except Exception as exc:
+                    consolidated = False
+                    message = f"{type(exc).__name__}: {exc}"
+                    state["weekly_consolidation_status"] = "error"
+                else:
+                    state["weekly_consolidation_status"] = (
+                        "success" if consolidated else "skipped"
+                    )
+
+                state["weekly_consolidation_message"] = message
+
+                with open(LOG_FILE, "a", encoding="utf-8") as log:
+                    log.write(
+                        "\n=== WEEKLY CONSOLIDATION "
+                        + now() + " === " + message + "\n"
+                    )
             else:
                 # WEEKLY usa esclusivamente la cache DAILY già pubblicata.
                 # Nessun secondo download Yahoo.

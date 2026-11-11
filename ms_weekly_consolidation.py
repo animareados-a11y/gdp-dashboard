@@ -17,15 +17,28 @@ def consolidate():
 
     info = json.loads(MANIFEST.read_text(encoding="utf-8"))
 
-    if info.get("publication_status") != "DEFINITIVO":
-        return False, "Versione WEEKLY non definitiva"
+    if info.get("publication_status") not in ("PROVVISORIO", "DEFINITIVO"):
+        return False, "Stato pubblicazione WEEKLY non valido"
 
     if info.get("weekly_science_sha256") != weekly_science_fingerprint():
         raise RuntimeError("Versione scientifica WEEKLY non coerente")
 
     friday = completed_friday_week()
     if friday is None:
-        return False, "Quotazioni del venerdì incomplete"
+        return False, "Venerdì non concluso o quotazioni incomplete"
+
+    # Verifica che la versione pubblicata utilizzi gli ultimi OHLCV.
+    # Deve precedere lo spostamento della base definitiva.
+    from ms_weekly_refresh_guard import weekly_input_fingerprint
+
+    latest_daily, last_final, current_fingerprint = weekly_input_fingerprint()
+    published_fingerprint = info.get("daily_ohlcv_fingerprint")
+
+    if not published_fingerprint or published_fingerprint != current_fingerprint:
+        return False, "Impronta OHLCV cambiata: ricalcolo WEEKLY necessario"
+
+    if last_final >= friday:
+        return False, "WEEKLY già consolidato"
 
     name = info.get("version", "")
     source = (VERSIONS / name).resolve()
@@ -77,6 +90,26 @@ def consolidate():
 
     if DEFINITIVE.resolve() != source:
         raise RuntimeError("Promozione non coerente")
+
+    # Allinea il manifest soltanto dopo la promozione verificata.
+    if info.get("publication_status") != "DEFINITIVO":
+        import tempfile
+
+        info["publication_status"] = "DEFINITIVO"
+        fd, temporary_manifest = tempfile.mkstemp(
+            prefix=".weekly_manifest_consolidated_",
+            suffix=".tmp",
+            dir=MANIFEST.parent,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(info, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_manifest, MANIFEST)
+        finally:
+            if os.path.exists(temporary_manifest):
+                os.unlink(temporary_manifest)
 
     return True, "WEEKLY definitivo consolidato: " + str(friday.date())
 

@@ -175,9 +175,12 @@ def completed_friday_week():
     days_since_friday = (today.weekday() - 4) % 7
     friday = today - pd.Timedelta(days=days_since_friday)
 
-    # Venerdì: attendere la chiusura di tutti i mercati.
+    # Venerdì: consolidamento consentito non prima delle 23:00 italiane.
+    # La verifica delle quotazioni rimane obbligatoria.
     if days_since_friday == 0:
-        return None
+        rome_now = now.tz_convert("Europe/Rome")
+        if rome_now.hour < 23:
+            return None
 
     for market, expected in EXPECTED.items():
         snapshot = SNAPSHOT / f"{market}_daily_master.csv"
